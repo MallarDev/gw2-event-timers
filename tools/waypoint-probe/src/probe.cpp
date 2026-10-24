@@ -99,7 +99,9 @@ void** findImport(const char* function, WORD ordinal) {
 bool replaceImport(void** slot, void* replacement, void** prior) {
     DWORD protection = 0;
     if (!VirtualProtect(slot, sizeof(void*), PAGE_READWRITE, &protection)) return false;
-    *prior = InterlockedExchangePointer(reinterpret_cast<void* volatile*>(slot), replacement);
+    // Publish the original target before another thread can enter the hook.
+    *prior = *slot;
+    InterlockedExchangePointer(reinterpret_cast<void* volatile*>(slot), replacement);
     DWORD unused = 0;
     VirtualProtect(slot, sizeof(void*), protection, &unused);
     return true;
