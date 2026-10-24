@@ -226,6 +226,19 @@ pub fn render_main_window(ui: &Ui) {
                                 *p.borrow_mut() = Some(event_name.clone());
                             });
                         }
+
+                        if let Some(link) = config.tracks.iter()
+                            .find(|t| t.name == track_name)
+                            .and_then(|t| t.events.iter().find(|ev| ev.name == event_name))
+                            .map(|ev| ev.copy_text.as_str())
+                        {
+                            if crate::pie_ui::available() && MenuItem::new("Open waypoint on map (Pie UI)").build(ui) {
+                                crate::pie_ui::open_waypoint(link);
+                            }
+                            if !link.is_empty() && MenuItem::new("Copy waypoint link").build(ui) {
+                                ui.set_clipboard_text(link);
+                            }
+                        }
                     }
                 });
             });
@@ -1270,19 +1283,21 @@ fn handle_track_tooltip(
                     ui.text(&timing_text);
                     if !event.copy_text.is_empty() {
                         ui.separator();
-                        ui.text(format!("Click to copy: {}", event.copy_text));
+                        ui.text(if crate::pie_ui::available() { "Click to open waypoint on map (Pie UI)" } else { "Click to copy waypoint" });
                     }
                 });
 
                 if ui.is_mouse_clicked(MouseButton::Left) && !event.copy_text.is_empty() {
-                    let copy_text = CACHED_COPY_WITH_EVENT_NAME.with(|c| {
-                        if c.get() {
-                            format!("{}: {}", event.name, event.copy_text)
-                        } else {
-                            event.copy_text.clone()
-                        }
-                    });
-                    ui.set_clipboard_text(&copy_text);
+                    if !crate::pie_ui::open_waypoint(&event.copy_text) {
+                        let copy_text = CACHED_COPY_WITH_EVENT_NAME.with(|c| {
+                            if c.get() {
+                                format!("{}: {}", event.name, event.copy_text)
+                            } else {
+                                event.copy_text.clone()
+                            }
+                        });
+                        ui.set_clipboard_text(&copy_text);
+                    }
                 }
 
                 // Right-click to track/untrack event

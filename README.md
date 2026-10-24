@@ -1,5 +1,17 @@
 # Event-Timers
 
+## Open a waypoint from the timeline
+
+With the optional Pie UI addon loaded, left-clicking an event with a waypoint
+opens the game's map at that waypoint. Select the waypoint and confirm travel
+in GW2. Without Pie UI, left-click still copies the link as before; right-click
+offers an explicit copy action. This does not travel automatically.
+
+The GitHub Actions `Build Event Timers DLL` workflow runs Windows tests and
+produces `EventTimers.dll` under its downloadable build artifact. Put that DLL
+directly in the GW2 `addons` directory and unload the original Event Timers
+first (both builds use the same addon signature).
+
 ## Test build 1.1.6
 
 - Saves configuration every two seconds with temporary-file and backup recovery.

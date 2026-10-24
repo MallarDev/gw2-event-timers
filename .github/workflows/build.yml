@@ -1,0 +1,32 @@
+name: Build Event Timers DLL
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Test
+        run: cargo test --locked
+      - name: Build DLL
+        run: cargo build --release --locked
+      - name: Stage DLL
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force dist | Out-Null
+          Copy-Item target/release/event_timers.dll dist/EventTimers.dll
+      - uses: actions/upload-artifact@v4
+        with:
+          name: EventTimers-Nexus-Windows-x64
+          path: dist/EventTimers.dll
+          if-no-files-found: error

@@ -19,6 +19,7 @@ mod config;
 mod json_loader;
 mod notification_logic;
 mod notifications;
+mod pie_ui;
 mod time_utils;
 mod ui;
 
@@ -71,11 +72,12 @@ nexus::export! {
     unload,
     flags: AddonFlags::None,
     provider: UpdateProvider::GitHub,
-    update_link: "https://github.com/qjv/event-timers",
+    update_link: "https://github.com/MallarDev/gw2-event-timers",
 }
 
 fn load() {
     load_user_config();
+    pie_ui::load();
     completion::load();
     BG_STOP.store(false, Ordering::Relaxed);
 
@@ -188,6 +190,7 @@ fn sync_quick_access() {
 }
 
 fn unload() {
+    pie_ui::unload();
     BG_STOP.store(true, Ordering::Relaxed);
     if let Some(h) = BG_THREAD.lock().take() {
         let _ = h.join();
