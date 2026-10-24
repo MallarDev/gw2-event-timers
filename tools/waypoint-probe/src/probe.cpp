@@ -68,10 +68,10 @@ TransformFn originalTransform = nullptr;
 void* transformAddress = nullptr;
 bool transformHooked = false;
 bool visible = true;
+bool restartPending = false;
 bool supported = false;
 bool hooked = false;
-bool baselineSaved = false;
-bool travelSaved = false;
+unsigned lastCapturedPhase = 0;
 std::filesystem::path directory;
 std::string status;
 
@@ -131,18 +131,23 @@ bool replaceImport(void** slot, void* replacement, void** prior) {
 }
 
 void recordCall(char kind, int length, const void* data = nullptr) {
-    const unsigned phase = activePhase.load(std::memory_order_acquire);
-    if (!phase) return;
     inFlight.fetch_add(1, std::memory_order_acq_rel);
-    if (activePhase.load(std::memory_order_acquire) == phase && GetTickCount64() < deadline.load(std::memory_order_acquire)) {
+    const unsigned phase = activePhase.load(std::memory_order_acquire);
+    if (phase && activePhase.load(std::memory_order_acquire) == phase &&
+        GetTickCount64() < deadline.load(std::memory_order_acquire)) {
         const size_t index = nextRecord.fetch_add(1, std::memory_order_relaxed);
         if (index < capacity) {
             Record& r = records[index];
+            r.ready.store(false, std::memory_order_relaxed);
             r.tick = GetTickCount64();
             r.thread = GetCurrentThreadId();
             r.phase = static_cast<unsigned char>(phase);
             r.kind = kind;
             r.length = length;
+            r.scannedBytes = 0;
+            r.offsetA = -1;
+            r.offsetB = -1;
+            r.rva.fill(0);
             if (kind == 'E' && data && length > 0) {
                 r.scannedBytes = static_cast<uint16_t>((std::min)(static_cast<size_t>(length), maxScanBytes));
                 const auto* input = static_cast<const unsigned char*>(data);
@@ -228,10 +233,18 @@ void stop() { activePhase.store(0, std::memory_order_release); }
 void save(unsigned phase) {
     if (activePhase.load(std::memory_order_acquire) != 0) { status = "Pare a captura antes de salvar."; return; }
     if (inFlight.load(std::memory_order_acquire) != 0) { status = "Aguardando chamadas pendentes; clique em salvar novamente."; return; }
+    if (lastCapturedPhase != phase) { status = "Nenhuma captura desse tipo pronta para salvar."; return; }
     if (directory.empty()) { status = "Nexus não forneceu um diretório de captura."; return; }
     try {
         std::filesystem::create_directories(directory);
-        const auto path = directory / (phase == 1 ? "baseline_v4.tsv" : "waypoint_v4.tsv");
+        const std::string prefix = phase == 1 ? "baseline_v5_" : "waypoint_v5_";
+        std::filesystem::path path;
+        for (unsigned number = 1; number < 1000000; ++number) {
+            path = directory / (prefix + std::to_string(number) + ".tsv");
+            if (!std::filesystem::exists(path)) break;
+            path.clear();
+        }
+        if (path.empty()) { status = "Limite de nomes de captura atingido."; return; }
         std::ofstream out(path, std::ios::trunc);
         if (!out) { status = "Não foi possível abrir o arquivo de captura."; return; }
         out << "phase\ttick_ms\tthread\tapi\tbytes\tscanned_bytes\tid_1072_offset\tid_1038_offset";
@@ -257,7 +270,7 @@ void save(unsigned phase) {
         }
         out.close();
         if (!out) { status = "Falha ao terminar a gravação do arquivo."; return; }
-        if (phase == 1) baselineSaved = true; else travelSaved = true;
+        lastCapturedPhase = 0;
         status = "Salvos " + std::to_string(count) + " registros em " + path.u8string();
     } catch (...) { status = "Falha ao salvar a captura no diretório do addon."; }
 }
@@ -265,15 +278,31 @@ void save(unsigned phase) {
 void start(unsigned phase, ULONGLONG seconds) {
     if (activePhase.load(std::memory_order_acquire)) { status = "Pare a captura atual primeiro."; return; }
     if (inFlight.load(std::memory_order_acquire)) { status = "Aguarde as chamadas pendentes."; return; }
-    if (phase == 1 && baselineSaved) { status = "A captura de repouso já foi salva nesta sessão."; return; }
-    if (phase == 2 && travelSaved) { status = "A captura da viagem já foi salva nesta sessão."; return; }
+    nextRecord.store(0, std::memory_order_release);
+    dropped.store(0, std::memory_order_relaxed);
+    markers.store(0, std::memory_order_relaxed);
+    lastCapturedPhase = phase;
     deadline.store(GetTickCount64() + seconds * 1000, std::memory_order_release);
     activePhase.store(phase, std::memory_order_release);
     status = phase == 1 ? "Registrando repouso por 10 segundos." : "Registrando viagem por 30 segundos. Viaje manualmente agora.";
 }
 
+void restartTravel() {
+    stop();
+    lastCapturedPhase = 0;
+    restartPending = true;
+    status = "Aguardando chamadas em curso para recomeçar a viagem.";
+}
+
 void render() {
     if (!visible) return;
+    if (restartPending && inFlight.load(std::memory_order_acquire) == 0) {
+        start(2, 30);
+        if (activePhase.load(std::memory_order_acquire) == 2) {
+            restartPending = false;
+            status = "Nova captura de viagem iniciada; tentativa anterior descartada.";
+        }
+    }
     ImGui::SetNextWindowSize(ImVec2(680, 290), ImGuiCond_FirstUseEver);
     if (ImGui::Begin(windowName, &visible)) {
         ImGui::TextWrapped("Sonda de metadados. Verifica dois IDs antes da transformação; não salva bytes de mensagens.");
@@ -282,11 +311,12 @@ void render() {
         else {
             const unsigned phase = activePhase.load(std::memory_order_acquire);
             if (phase && GetTickCount64() >= deadline.load(std::memory_order_acquire)) stop();
-            if (ImGui::Button("Capturar repouso (10 s)")) start(1, 10);
+            if (ImGui::Button("Capturar repouso (10 s)")) { restartPending = false; start(1, 10); }
             ImGui::SameLine();
-            if (ImGui::Button("Capturar viagem (30 s)")) start(2, 30);
+            if (ImGui::Button("Capturar viagem (30 s)")) { restartPending = false; start(2, 30); }
             ImGui::SameLine();
-            if (ImGui::Button("Parar")) stop();
+            if (ImGui::Button("Parar")) { restartPending = false; stop(); }
+            if (ImGui::Button("Recomeçar viagem (descartar atual)")) restartTravel();
             if (ImGui::Button("Salvar repouso")) save(1);
             ImGui::SameLine();
             if (ImGui::Button("Salvar viagem")) save(2);
@@ -297,7 +327,7 @@ void render() {
             ImGui::Text("Marcas: %u | preparação de envio: %s", markers.load(),
                 preSendHooked ? "ativa" : "indisponível (send ainda ativo)");
             ImGui::Text("Verificação anterior à transformação: %s", transformHooked ? "ativa" : "indisponível");
-            ImGui::TextWrapped("Cada fase pode ser salva uma vez por sessão; reinicie o jogo para repetir.");
+            ImGui::TextWrapped("Você pode repetir as capturas sem reiniciar. Salvar cria um novo arquivo numerado.");
         }
         ImGui::Separator();
         ImGui::TextWrapped("%s", status.c_str());
@@ -364,7 +394,7 @@ extern "C" __declspec(dllexport) AddonDefinition_t* GetAddonDef() {
     definition.Name = "Waypoint Probe";
     definition.Author = "Mallard";
     definition.Description = "Metadados de envio e verificação de IDs antes da transformação.";
-    definition.Version = {0, 4, 0, 0};
+    definition.Version = {0, 5, 0, 0};
     definition.Load = load; definition.Unload = unload;
     definition.Flags = AF_DisableHotloading;
     definition.Provider = UP_None;
