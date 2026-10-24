@@ -2,6 +2,7 @@
 #include <windows.h>
 #include "Nexus.h"
 #include "imgui.h"
+#include "MinHook.h"
 
 #include <algorithm>
 #include <array>
@@ -19,8 +20,13 @@ constexpr DWORD expectedImageSize = 0x02c49000;
 constexpr size_t capacity = 16384;
 constexpr int framesPerCall = 12;
 constexpr const char* windowName = "Waypoint Probe###MALLARD_WAYPOINT_PROBE";
+constexpr const char* markerBind = "MALLARD_WAYPOINT_PROBE_MARK";
+constexpr size_t preSendRva = 0x00fe9e60;
+constexpr unsigned char preSendBytes[] = {0x48, 0x8b, 0x49, 0x30, 0x45, 0x8b, 0xc8,
+                                          0x4c, 0x8b, 0xc2, 0x41, 0x8b, 0xd1};
 using SendFn = int (WSAAPI*)(SOCKET, const char*, int, int);
 using SendToFn = int (WSAAPI*)(SOCKET, const char*, int, int, const sockaddr*, int);
+using PreSendFn = uintptr_t (*)(void*, const void*, unsigned);
 
 struct Record {
     std::atomic<bool> ready{false};
@@ -37,6 +43,7 @@ std::atomic<unsigned> inFlight{0};
 std::atomic<unsigned> activePhase{0};
 std::atomic<ULONGLONG> deadline{0};
 std::atomic<unsigned> dropped{0};
+std::atomic<unsigned> markers{0};
 AddonAPI_t* api = nullptr;
 HMODULE host = nullptr;
 size_t hostSize = 0;
@@ -44,6 +51,10 @@ void** sendSlot = nullptr;
 void** sendToSlot = nullptr;
 SendFn originalSend = nullptr;
 SendToFn originalSendTo = nullptr;
+PreSendFn originalPreSend = nullptr;
+void* preSendAddress = nullptr;
+bool minHookInitialized = false;
+bool preSendHooked = false;
 bool visible = true;
 bool supported = false;
 bool hooked = false;
@@ -120,14 +131,17 @@ void recordCall(char kind, int length) {
             r.phase = static_cast<unsigned char>(phase);
             r.kind = kind;
             r.length = length;
-            void* stack[framesPerCall]{};
-            const USHORT count = CaptureStackBackTrace(2, framesPerCall, stack, nullptr);
-            const uintptr_t base = reinterpret_cast<uintptr_t>(host);
-            for (USHORT i = 0; i < count; ++i) {
-                const uintptr_t p = reinterpret_cast<uintptr_t>(stack[i]);
-                r.rva[i] = p >= base && p - base < hostSize ? static_cast<uint64_t>(p - base) : 0;
+            if (kind != 'M') {
+                void* stack[framesPerCall]{};
+                const USHORT count = CaptureStackBackTrace(2, framesPerCall, stack, nullptr);
+                const uintptr_t base = reinterpret_cast<uintptr_t>(host);
+                for (USHORT i = 0; i < count; ++i) {
+                    const uintptr_t p = reinterpret_cast<uintptr_t>(stack[i]);
+                    r.rva[i] = p >= base && p - base < hostSize ? static_cast<uint64_t>(p - base) : 0;
+                }
             }
             r.ready.store(true, std::memory_order_release);
+            if (kind == 'M') markers.fetch_add(1, std::memory_order_relaxed);
         } else dropped.fetch_add(1, std::memory_order_relaxed);
     }
     inFlight.fetch_sub(1, std::memory_order_release);
@@ -142,6 +156,35 @@ int WSAAPI tracedSendTo(SOCKET socket, const char* data, int length, int flags, 
     return originalSendTo(socket, data, length, flags, address, addressLength);
 }
 
+uintptr_t tracedPreSend(void* object, const void* bytes, unsigned length) {
+    recordCall('P', static_cast<int>(length));
+    return originalPreSend(object, bytes, length);
+}
+
+void markConfirmation() {
+    if (activePhase.load(std::memory_order_acquire) != 2) {
+        status = "Inicie a captura de viagem antes de marcar a confirmação.";
+        return;
+    }
+    recordCall('M', 0);
+}
+
+void onMarkerBind(const char*, bool release) {
+    if (!release && activePhase.load(std::memory_order_acquire) == 2) recordCall('M', 0);
+}
+
+void installPreSendHook() {
+    if (preSendRva + sizeof(preSendBytes) > hostSize) return;
+    preSendAddress = reinterpret_cast<unsigned char*>(host) + preSendRva;
+    if (std::memcmp(preSendAddress, preSendBytes, sizeof(preSendBytes)) != 0) return;
+    if (MH_Initialize() != MH_OK) return;
+    minHookInitialized = true;
+    if (MH_CreateHook(preSendAddress, reinterpret_cast<void*>(&tracedPreSend),
+                      reinterpret_cast<void**>(&originalPreSend)) != MH_OK) return;
+    if (MH_EnableHook(preSendAddress) == MH_OK) preSendHooked = true;
+    else { MH_RemoveHook(preSendAddress); originalPreSend = nullptr; }
+}
+
 void stop() { activePhase.store(0, std::memory_order_release); }
 
 void save(unsigned phase) {
@@ -150,7 +193,7 @@ void save(unsigned phase) {
     if (directory.empty()) { status = "Nexus não forneceu um diretório de captura."; return; }
     try {
         std::filesystem::create_directories(directory);
-        const auto path = directory / (phase == 1 ? "baseline.tsv" : "waypoint.tsv");
+        const auto path = directory / (phase == 1 ? "baseline_v2.tsv" : "waypoint_v2.tsv");
         std::ofstream out(path, std::ios::trunc);
         if (!out) { status = "Não foi possível abrir o arquivo de captura."; return; }
         out << "phase\ttick_ms\tthread\tapi\tbytes";
@@ -191,7 +234,7 @@ void render() {
     if (!visible) return;
     ImGui::SetNextWindowSize(ImVec2(680, 290), ImGuiCond_FirstUseEver);
     if (ImGui::Begin(windowName, &visible)) {
-        ImGui::TextWrapped("Diagnóstico local de chamadas send/sendto. Não registra conteúdo dos pacotes.");
+        ImGui::TextWrapped("Diagnóstico de send/sendto e preparação de envio. Não registra conteúdo dos pacotes.");
         if (!supported) ImGui::TextWrapped("Executável diferente do GW2 fornecido: captura desativada.");
         else if (!hooked) ImGui::TextWrapped("Não foi possível instalar a captura nos imports de WS2_32.");
         else {
@@ -205,9 +248,12 @@ void render() {
             if (ImGui::Button("Salvar repouso")) save(1);
             ImGui::SameLine();
             if (ImGui::Button("Salvar viagem")) save(2);
+            if (ImGui::Button("Marcar confirmação (Ctrl+Alt+M)")) markConfirmation();
             ImGui::Text("Estado: %s | chamadas: %zu / %zu | descartadas: %u",
                 activePhase.load() == 1 ? "repouso" : activePhase.load() == 2 ? "viagem" : "parado",
                 (std::min)(nextRecord.load(), capacity), capacity, dropped.load());
+            ImGui::Text("Marcas: %u | preparação de envio: %s", markers.load(),
+                preSendHooked ? "ativa" : "indisponível (send ainda ativo)");
             ImGui::TextWrapped("Cada fase pode ser salva uma vez por sessão; reinicie o jogo para repetir.");
         }
         ImGui::Separator();
@@ -218,7 +264,7 @@ void render() {
 
 void options() {
     if (ImGui::Button("Abrir Waypoint Probe")) visible = true;
-    ImGui::TextWrapped("As capturas ficam no diretório WaypointProbe dos addons do Nexus.");
+    ImGui::TextWrapped("Marque a confirmação com Ctrl+Alt+M imediatamente antes de clicar em Viajar. As capturas ficam no diretório WaypointProbe dos addons do Nexus.");
 }
 
 void load(AddonAPI_t* nexus) {
@@ -231,6 +277,7 @@ void load(AddonAPI_t* nexus) {
     supported = supportedExecutable();
     if (directory.empty()) status = "Nexus não forneceu um diretório de captura.";
     if (supported) {
+        installPreSendHook();
         sendSlot = findImport("send", 19);
         sendToSlot = findImport("sendto", 20);
         if (sendSlot && replaceImport(sendSlot, reinterpret_cast<void*>(&tracedSend), reinterpret_cast<void**>(&originalSend))) {
@@ -240,17 +287,23 @@ void load(AddonAPI_t* nexus) {
         }
         if (!hooked) status = "Import send não encontrado ou não modificável.";
     } else status = "Assinatura do executável não corresponde ao arquivo analisado.";
+    api->InputBinds_RegisterWithString(markerBind, onMarkerBind, "CTRL+ALT+M");
     api->GUI_Register(RT_Render, render);
     api->GUI_Register(RT_OptionsRender, options);
 }
 
 void unload() {
     stop();
-    if (api) { api->GUI_Deregister(render); api->GUI_Deregister(options); }
+    if (api) {
+        api->GUI_Deregister(render); api->GUI_Deregister(options);
+        api->InputBinds_Deregister(markerBind);
+    }
     // Hotloading is disabled; this callback is reached as the game is shutting down.
     void* ignored = nullptr;
     if (sendSlot && originalSend) replaceImport(sendSlot, reinterpret_cast<void*>(originalSend), &ignored);
     if (sendToSlot && originalSendTo) replaceImport(sendToSlot, reinterpret_cast<void*>(originalSendTo), &ignored);
+    if (preSendHooked) MH_DisableHook(preSendAddress);
+    if (minHookInitialized) MH_Uninitialize();
 }
 }
 
@@ -261,7 +314,7 @@ extern "C" __declspec(dllexport) AddonDefinition_t* GetAddonDef() {
     definition.Name = "Waypoint Probe";
     definition.Author = "Mallard";
     definition.Description = "Captura diagnóstica de chamadas de rede durante viagem manual.";
-    definition.Version = {0, 1, 0, 0};
+    definition.Version = {0, 2, 0, 0};
     definition.Load = load; definition.Unload = unload;
     definition.Flags = AF_DisableHotloading;
     definition.Provider = UP_None;
