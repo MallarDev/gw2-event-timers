@@ -2,7 +2,6 @@
 #include <windows.h>
 #include "Nexus.h"
 #include "imgui.h"
-#include "MinHook.h"
 
 #include <algorithm>
 #include <array>
@@ -53,7 +52,6 @@ SendFn originalSend = nullptr;
 SendToFn originalSendTo = nullptr;
 PreSendFn originalPreSend = nullptr;
 void* preSendAddress = nullptr;
-bool minHookInitialized = false;
 bool preSendHooked = false;
 bool visible = true;
 bool supported = false;
@@ -177,12 +175,11 @@ void installPreSendHook() {
     if (preSendRva + sizeof(preSendBytes) > hostSize) return;
     preSendAddress = reinterpret_cast<unsigned char*>(host) + preSendRva;
     if (std::memcmp(preSendAddress, preSendBytes, sizeof(preSendBytes)) != 0) return;
-    if (MH_Initialize() != MH_OK) return;
-    minHookInitialized = true;
-    if (MH_CreateHook(preSendAddress, reinterpret_cast<void*>(&tracedPreSend),
+    if (!api->MinHook_Create || !api->MinHook_Enable || !api->MinHook_Remove || !api->MinHook_Disable) return;
+    if (api->MinHook_Create(preSendAddress, reinterpret_cast<void*>(&tracedPreSend),
                       reinterpret_cast<void**>(&originalPreSend)) != MH_OK) return;
-    if (MH_EnableHook(preSendAddress) == MH_OK) preSendHooked = true;
-    else { MH_RemoveHook(preSendAddress); originalPreSend = nullptr; }
+    if (api->MinHook_Enable(preSendAddress) == MH_OK) preSendHooked = true;
+    else { api->MinHook_Remove(preSendAddress); originalPreSend = nullptr; }
 }
 
 void stop() { activePhase.store(0, std::memory_order_release); }
@@ -302,8 +299,10 @@ void unload() {
     void* ignored = nullptr;
     if (sendSlot && originalSend) replaceImport(sendSlot, reinterpret_cast<void*>(originalSend), &ignored);
     if (sendToSlot && originalSendTo) replaceImport(sendToSlot, reinterpret_cast<void*>(originalSendTo), &ignored);
-    if (preSendHooked) MH_DisableHook(preSendAddress);
-    if (minHookInitialized) MH_Uninitialize();
+    if (preSendHooked) {
+        api->MinHook_Disable(preSendAddress);
+        api->MinHook_Remove(preSendAddress);
+    }
 }
 }
 

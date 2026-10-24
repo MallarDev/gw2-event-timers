@@ -6,7 +6,7 @@ Este addon de diagnóstico do Nexus examina chamadas `send` e `sendto` feitas pe
 
 A instrumentação somente é ativada se a assinatura PE (timestamp `0x6ad7acf4`, tamanho da imagem `0x02c49000`) corresponder à versão de `Gw2-64.exe` fornecida para análise em 24/10/2026. A assinatura é um controle de compatibilidade, não uma prova criptográfica de identidade. Qualquer atualização do jogo exige nova inspeção. A DLL pode ser instalada sem a instrumentação ativa; nesse caso a janela indica o motivo.
 
-O hook interno só é ativado se os bytes da função, na posição examinada do executável fornecido, também corresponderem exatamente. Se a instrumentação interna falhar (inclusive sob Wine/Proton), `send`/`sendto` continuam disponíveis, e a janela mostra **preparação de envio: indisponível**. O addon usa `AF_DisableHotloading`: reinicie o jogo para instalar, atualizar ou remover a DLL. Faça primeiro um teste em uma sessão curta. Trata-se de instrumentação experimental do processo do jogo; pode causar instabilidade.
+O hook interno só é ativado se os bytes da função, na posição examinada do executável fornecido, também corresponderem exatamente. Ele usa a interface de hooks do Nexus. Se a instrumentação interna falhar (inclusive sob Wine/Proton), `send`/`sendto` continuam disponíveis, e a janela mostra **preparação de envio: indisponível**. O addon usa `AF_DisableHotloading`: reinicie o jogo para instalar, atualizar ou remover a DLL. Faça primeiro um teste em uma sessão curta. Trata-se de instrumentação experimental do processo do jogo; pode causar instabilidade.
 
 ## Procedimento
 
@@ -23,4 +23,4 @@ Os arquivos guardam fase, tempo monotônico em milissegundos, identificador de t
 
 ## Build
 
-Na branch diagnóstica, o workflow `.github/workflows/waypoint-probe.yml` usa MSVC x64, CMake e versões fixadas dos headers Nexus, ImGui e MinHook (v1.3.4). Roda um smoke test de carregamento e exportação do addon antes de disponibilizar o artefato, acompanhado da licença do MinHook. Nenhum código do Event Timers principal é modificado.
+Na branch diagnóstica, o workflow `.github/workflows/waypoint-probe.yml` usa MSVC x64, CMake e versões fixadas dos headers Nexus e ImGui. Roda um smoke test de carregamento e exportação do addon antes de disponibilizar o artefato. Nenhum código do Event Timers principal é modificado.
