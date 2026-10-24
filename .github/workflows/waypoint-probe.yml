@@ -1,0 +1,27 @@
+name: Waypoint Probe diagnostic DLL
+on:
+  push:
+    branches: [diagnostic/waypoint-send-trace]
+    paths:
+      - 'tools/waypoint-probe/**'
+      - '.github/workflows/waypoint-probe.yml'
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-2022
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure
+        run: cmake -S tools/waypoint-probe -B build/waypoint-probe -A x64 -DCMAKE_BUILD_TYPE=Release
+      - name: Build
+        run: cmake --build build/waypoint-probe --config Release --parallel
+      - name: Verify DLL export
+        run: ctest --test-dir build/waypoint-probe -C Release --output-on-failure
+      - uses: actions/upload-artifact@v4
+        with:
+          name: WaypointProbe-diagnostic-x64
+          path: build/waypoint-probe/Release/WaypointProbe.dll
+          if-no-files-found: error
