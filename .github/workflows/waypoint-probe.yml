@@ -20,8 +20,12 @@ jobs:
         run: cmake --build build/waypoint-probe --config Release --parallel
       - name: Verify DLL export
         run: ctest --test-dir build/waypoint-probe -C Release --output-on-failure
+      - name: Include MinHook license
+        run: Copy-Item build/waypoint-probe/_deps/minhook-src/LICENSE.txt build/waypoint-probe/Release/MinHook-LICENSE.txt
       - uses: actions/upload-artifact@v4
         with:
           name: WaypointProbe-diagnostic-x64
-          path: build/waypoint-probe/Release/WaypointProbe.dll
+          path: |
+            build/waypoint-probe/Release/WaypointProbe.dll
+            build/waypoint-probe/Release/MinHook-LICENSE.txt
           if-no-files-found: error
