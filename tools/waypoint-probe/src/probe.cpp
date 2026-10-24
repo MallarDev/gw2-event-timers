@@ -18,6 +18,7 @@ constexpr DWORD expectedTimestamp = 0x6ad7acf4;
 constexpr DWORD expectedImageSize = 0x02c49000;
 constexpr size_t capacity = 16384;
 constexpr int framesPerCall = 12;
+constexpr size_t maxPayloadBytes = 2048;
 constexpr const char* windowName = "Waypoint Probe###MALLARD_WAYPOINT_PROBE";
 constexpr const char* markerBind = "MALLARD_WAYPOINT_PROBE_MARK";
 constexpr size_t preSendRva = 0x00fe9e60;
@@ -34,6 +35,8 @@ struct Record {
     unsigned char phase{};
     char kind{};
     int length{};
+    uint16_t capturedBytes{};
+    std::array<unsigned char, maxPayloadBytes> payload{};
     std::array<uint64_t, framesPerCall> rva{};
 };
 std::array<Record, capacity> records{};
@@ -116,7 +119,7 @@ bool replaceImport(void** slot, void* replacement, void** prior) {
     return true;
 }
 
-void recordCall(char kind, int length) {
+void recordCall(char kind, int length, const void* data = nullptr) {
     const unsigned phase = activePhase.load(std::memory_order_acquire);
     if (!phase) return;
     inFlight.fetch_add(1, std::memory_order_acq_rel);
@@ -129,6 +132,10 @@ void recordCall(char kind, int length) {
             r.phase = static_cast<unsigned char>(phase);
             r.kind = kind;
             r.length = length;
+            if (data && length > 0) {
+                r.capturedBytes = static_cast<uint16_t>((std::min)(static_cast<size_t>(length), maxPayloadBytes));
+                std::memcpy(r.payload.data(), data, r.capturedBytes);
+            }
             if (kind != 'M') {
                 void* stack[framesPerCall]{};
                 const USHORT count = CaptureStackBackTrace(2, framesPerCall, stack, nullptr);
@@ -146,16 +153,16 @@ void recordCall(char kind, int length) {
 }
 
 int WSAAPI tracedSend(SOCKET socket, const char* data, int length, int flags) {
-    recordCall('S', length);
+    recordCall('S', length, data);
     return originalSend(socket, data, length, flags);
 }
 int WSAAPI tracedSendTo(SOCKET socket, const char* data, int length, int flags, const sockaddr* address, int addressLength) {
-    recordCall('T', length);
+    recordCall('T', length, data);
     return originalSendTo(socket, data, length, flags, address, addressLength);
 }
 
 uintptr_t tracedPreSend(void* object, const void* bytes, unsigned length) {
-    recordCall('P', static_cast<int>(length));
+    recordCall('P', static_cast<int>(length), bytes);
     return originalPreSend(object, bytes, length);
 }
 
@@ -190,10 +197,10 @@ void save(unsigned phase) {
     if (directory.empty()) { status = "Nexus não forneceu um diretório de captura."; return; }
     try {
         std::filesystem::create_directories(directory);
-        const auto path = directory / (phase == 1 ? "baseline_v2.tsv" : "waypoint_v2.tsv");
+        const auto path = directory / (phase == 1 ? "baseline_v3.tsv" : "waypoint_v3.tsv");
         std::ofstream out(path, std::ios::trunc);
         if (!out) { status = "Não foi possível abrir o arquivo de captura."; return; }
-        out << "phase\ttick_ms\tthread\tapi\tbytes";
+        out << "phase\ttick_ms\tthread\tapi\tbytes\tcaptured_bytes\tpayload_hex\tpayload_ascii";
         for (int i = 0; i < framesPerCall; ++i) out << "\tgw2_rva_" << i;
         out << '\n';
         size_t count = 0;
@@ -202,6 +209,17 @@ void save(unsigned phase) {
             const Record& r = records[i];
             if (!r.ready.load(std::memory_order_acquire) || r.phase != phase) continue;
             out << static_cast<int>(r.phase) << '\t' << r.tick << '\t' << r.thread << '\t' << r.kind << '\t' << r.length;
+            out << '\t' << r.capturedBytes << '\t';
+            constexpr char digits[] = "0123456789ABCDEF";
+            for (uint16_t n = 0; n < r.capturedBytes; ++n) {
+                const unsigned char byte = r.payload[n];
+                out.put(digits[byte >> 4]); out.put(digits[byte & 0xf]);
+            }
+            out << '\t';
+            for (uint16_t n = 0; n < r.capturedBytes; ++n) {
+                const unsigned char byte = r.payload[n];
+                out.put(byte >= 0x20 && byte <= 0x7e ? static_cast<char>(byte) : '.');
+            }
             for (const auto rva : r.rva) {
                 char hex[24]{};
                 if (rva) std::snprintf(hex, sizeof(hex), "%llX", static_cast<unsigned long long>(rva));
@@ -231,7 +249,7 @@ void render() {
     if (!visible) return;
     ImGui::SetNextWindowSize(ImVec2(680, 290), ImGuiCond_FirstUseEver);
     if (ImGui::Begin(windowName, &visible)) {
-        ImGui::TextWrapped("Diagnóstico de send/sendto e preparação de envio. Não registra conteúdo dos pacotes.");
+        ImGui::TextWrapped("Captura local de até 2048 bytes por envio em hexadecimal e ASCII. Pode conter dados de sessão: revise os TSV antes de compartilhar.");
         if (!supported) ImGui::TextWrapped("Executável diferente do GW2 fornecido: captura desativada.");
         else if (!hooked) ImGui::TextWrapped("Não foi possível instalar a captura nos imports de WS2_32.");
         else {
@@ -313,7 +331,7 @@ extern "C" __declspec(dllexport) AddonDefinition_t* GetAddonDef() {
     definition.Name = "Waypoint Probe";
     definition.Author = "Mallard";
     definition.Description = "Captura diagnóstica de chamadas de rede durante viagem manual.";
-    definition.Version = {0, 2, 0, 0};
+    definition.Version = {0, 3, 0, 0};
     definition.Load = load; definition.Unload = unload;
     definition.Flags = AF_DisableHotloading;
     definition.Provider = UP_None;
