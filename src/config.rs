@@ -11,6 +11,13 @@ use std::{
 
 use crate::json_loader::{load_tracks_from_json, EventTrack};
 
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum WaypointClickAction {
+    Copy,
+    #[default]
+    OpenMap,
+}
+
 // === Notification Types ===
 
 /// Identifies a specific event by track and event name
@@ -365,6 +372,8 @@ pub struct UserConfig {
     pub close_on_escape: bool,
     #[serde(default)]
     pub copy_with_event_name: bool,
+    #[serde(default)]
+    pub waypoint_click_action: WaypointClickAction,
     #[serde(default = "default_true")]
     pub show_quick_access_icon: bool,
     #[serde(default)]
@@ -516,6 +525,7 @@ impl Default for UserConfig {
             label_column_category_color: [0.8, 0.8, 0.2, 1.0],
             close_on_escape: true,
             copy_with_event_name: false,
+            waypoint_click_action: WaypointClickAction::default(),
             show_quick_access_icon: true,
             setup_onboarding_seen: false,
             time_ruler_interval: TimeRulerInterval::default(),
@@ -566,6 +576,7 @@ pub struct RuntimeConfig {
     pub label_column_category_color: [f32; 4],
     pub close_on_escape: bool,
     pub copy_with_event_name: bool,
+    pub waypoint_click_action: WaypointClickAction,
     pub show_quick_access_icon: bool,
     pub setup_onboarding_seen: bool,
 
@@ -618,6 +629,7 @@ impl Default for RuntimeConfig {
             label_column_category_color: [0.8, 0.8, 0.2, 1.0],
             close_on_escape: true,
             copy_with_event_name: false,
+            waypoint_click_action: WaypointClickAction::default(),
             show_quick_access_icon: true,
             setup_onboarding_seen: false,
             time_ruler_interval: TimeRulerInterval::default(),
@@ -714,6 +726,7 @@ pub fn apply_user_overrides() {
                 user_cfg.oneshot_events.clone(),
                 user_cfg.notification_config.clone(),
                 user_cfg.setup_onboarding_seen,
+                user_cfg.waypoint_click_action,
             ),
         )
     }; // user_cfg lock dropped here
@@ -788,6 +801,7 @@ pub fn apply_user_overrides() {
         runtime.oneshot_events = user_settings.38;
         runtime.notification_config = user_settings.39;
         runtime.setup_onboarding_seen = user_settings.40;
+        runtime.waypoint_click_action = user_settings.41;
     } // runtime lock dropped here
 }
 
@@ -865,6 +879,7 @@ pub fn extract_user_overrides() {
     user_cfg.label_column_category_color = runtime.label_column_category_color;
     user_cfg.close_on_escape = runtime.close_on_escape;
     user_cfg.copy_with_event_name = runtime.copy_with_event_name;
+    user_cfg.waypoint_click_action = runtime.waypoint_click_action;
     user_cfg.show_quick_access_icon = runtime.show_quick_access_icon;
     user_cfg.setup_onboarding_seen = runtime.setup_onboarding_seen;
     user_cfg.time_ruler_interval = runtime.time_ruler_interval;

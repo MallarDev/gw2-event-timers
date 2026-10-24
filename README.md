@@ -2,7 +2,8 @@
 
 ## Open a waypoint from the timeline
 
-With the optional Pie UI addon loaded, left-clicking an event with a waypoint
+In Settings, choose Copy waypoint or Open map for a timeline left-click.
+With the optional Pie UI addon loaded, the Open map choice on an event with a waypoint
 opens the game's map at that waypoint. Select the waypoint and confirm travel
 in GW2. Without Pie UI, left-click still copies the link as before; right-click
 offers an explicit copy action. This does not travel automatically.

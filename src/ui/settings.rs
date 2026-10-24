@@ -333,6 +333,16 @@ pub fn render_settings(ui: &Ui) {
         // --- Other ---
         ui.text("Other");
         ui.checkbox("Close window with ESC", &mut config.close_on_escape);
+        ui.text("Left-click on event waypoint:");
+        if ui.radio_button_bool("Copy waypoint", config.waypoint_click_action == crate::config::WaypointClickAction::Copy) {
+            config.waypoint_click_action = crate::config::WaypointClickAction::Copy;
+        }
+        if ui.radio_button_bool("Open map (requires Pie UI)", config.waypoint_click_action == crate::config::WaypointClickAction::OpenMap) {
+            config.waypoint_click_action = crate::config::WaypointClickAction::OpenMap;
+        }
+        if config.waypoint_click_action == crate::config::WaypointClickAction::OpenMap && !crate::pie_ui::available() {
+            ui.text_disabled("Pie UI not loaded: click copies the waypoint instead.");
+        }
         ui.checkbox(
             "Include event name when copying waypoint",
             &mut config.copy_with_event_name,

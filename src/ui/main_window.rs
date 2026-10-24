@@ -1,4 +1,4 @@
-use crate::config::{get_track_visual_config, LabelColumnPosition, TextAlignment, RUNTIME_CONFIG};
+use crate::config::{get_track_visual_config, LabelColumnPosition, TextAlignment, WaypointClickAction, RUNTIME_CONFIG};
 use crate::json_loader::EventTrack;
 use crate::notification_logic::{
     toggle_event_favorite, toggle_event_tracking, toggle_oneshot_tracking,
@@ -112,6 +112,7 @@ pub fn render_main_window(ui: &Ui) {
     let label_bg_color = config.label_column_bg_color;
     let label_text_color = config.label_column_text_color;
     let label_category_color = config.label_column_category_color;
+    let waypoint_click_action = config.waypoint_click_action;
 
     // Calculate time ONCE per frame
     let current_time = get_current_unix_time();
@@ -1283,12 +1284,12 @@ fn handle_track_tooltip(
                     ui.text(&timing_text);
                     if !event.copy_text.is_empty() {
                         ui.separator();
-                        ui.text(if crate::pie_ui::available() { "Click to open waypoint on map (Pie UI)" } else { "Click to copy waypoint" });
+                        ui.text(if waypoint_click_action == WaypointClickAction::OpenMap && crate::pie_ui::available() { "Click to open waypoint on map (Pie UI)" } else { "Click to copy waypoint" });
                     }
                 });
 
                 if ui.is_mouse_clicked(MouseButton::Left) && !event.copy_text.is_empty() {
-                    if !crate::pie_ui::open_waypoint(&event.copy_text) {
+                    if waypoint_click_action != WaypointClickAction::OpenMap || !crate::pie_ui::open_waypoint(&event.copy_text) {
                         let copy_text = CACHED_COPY_WITH_EVENT_NAME.with(|c| {
                             if c.get() {
                                 format!("{}: {}", event.name, event.copy_text)
