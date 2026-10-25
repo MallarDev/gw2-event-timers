@@ -1,27 +1,38 @@
-# Waypoint Probe v0.5 (diagnóstico separado)
+# Waypoint Probe v0.6
 
-Esta DLL observa chamadas `send`/`sendto`, a preparação do envio (`P`) e a entrada de uma transformação de bytes (`E`) no executável do GW2 fornecido. **Não inicia viagens nem envia comandos.**
+Sonda separada do Event Timers. Observa duas rotinas do diálogo de confirmação encontrado no executável fornecido. Registra automaticamente a associação do destino (`DESTINATION`), o botão de cancelar (`CANCEL`) e a entrada/retorno do tratamento de confirmar (`ACCEPT_ENTER`, `ACCEPT_RETURN`). Os nomes dos eventos descrevem a interpretação da análise estática, a ser validada no jogo.
 
-O hook `E` verifica se a entrada, antes da transformação, contém os valores de quatro bytes `30 04 00 00` (waypoint 1072, A) ou `0E 04 00 00` (waypoint 1038, B). Examina até 2048 bytes de cada chamada. Grava somente o deslocamento do primeiro achado, o tamanho examinado, horário, thread e até 12 endereços de retorno relativos ao executável. Os hooks `P`, `S` e `T` gravam somente metadados. **Nenhum payload, hash ou trecho de conteúdo é salvo pela v0.5.** Os arquivos anteriores permanecem no disco até você os apagar.
+Esta versão não inicia viagens. O objetivo do teste é verificar se o diálogo observado é o de waypoint e se o ID lido corresponde ao destino escolhido. O retorno do tratamento de confirmar não comprova que o servidor aceitou a viagem. Anote se houve loading e chegada ao destino.
 
-Um achado desses valores pode ser coincidência; a ausência deles não exclui que o destino seja codificado em outro formato ou passe por outro caminho. O ponto `E` é parte do processamento de saída, não a função que escolhe o waypoint. A rotina usa operações semelhantes ao gerador de bytes do RC4, mas isso não identifica o protocolo nem o comando de viagem.
+Não há hooks de rede, leitura de payload, busca de padrões em mensagens nem gravação de texto do jogo. As únicas leituras de dados do jogo são campos fixos: ponteiro para a definição do destino (usado internamente, não gravado), ID numérico do destino e dois campos numéricos do evento de botão. Também são gravados horário, thread e endereços de retorno relativos ao executável. Uma leitura inválida recebe `read_ok=0`.
 
-## Compatibilidade
+## Instalação e teste
 
-A instrumentação somente é ativada se o PE tiver timestamp `0x6ad7acf4` e tamanho de imagem `0x02c49000`, correspondentes ao `Gw2-64.exe` fornecido em 24/10/2026. Cada hook interno também confere os bytes iniciais da função antes de instalar. Uma atualização do jogo exige nova análise. A DLL usa `AF_DisableHotloading`: reinicie o jogo ao instalar, atualizar ou remover. A instrumentação experimental pode causar instabilidade; faça uma sessão curta primeiro.
+1. Feche o jogo, substitua a DLL anterior por `WaypointProbe.dll` e abra o jogo. Confira a janela **Waypoint Probe v0.6** e os estados **Destino: ativo | confirmação: ativa**. Se algum estiver indisponível, informe isso; não repita viagens para produzir um arquivo vazio.
+2. Comece em um local diferente de A. Clique **Iniciar / recomeçar**. Há até 3 minutos para o teste; a janela pode ser fechada e reaberta pelas opções do addon sem parar a captura.
+3. Abra a confirmação para A (`[&BDAEAAA=]`) e **cancele pelo botão do diálogo**.
+4. Abra A novamente, **confirme a viagem** e aguarde chegar.
+5. Abra B (`[&BA4EAAA=]`), **confirme a viagem** e aguarde chegar.
+6. Clique **Parar e salvar**. Envie `waypoint_ui_v6_1.tsv` (ou o próximo número) e diga se as duas viagens aconteceram. O caminho aparece na janela; o diretório é o `WaypointProbe` dos addons, como nas versões anteriores.
 
-## Captura
+Não é necessário usar Ctrl+Alt+M nem alinhar uma marca com o clique. Para repetir, use **Iniciar / recomeçar** na mesma sessão. A captura anterior é descartada; os arquivos já salvos são preservados e numerados. Só a troca de DLL exige reiniciar o jogo.
 
-1. Substitua `WaypointProbe.dll` na pasta de addons do Nexus pela v0.5 e reinicie o jogo. Na janela do probe, confira **verificação anterior à transformação: ativa**.
-2. Opcional: capture e salve 10 segundos em repouso, para comparação.
-3. Clique **Capturar viagem (30 s)**. Viaje manualmente para A (`[&BDAEAAA=]`), B (`[&BA4EAAA=]`) e A novamente. Pouco antes de cada confirmação pressione `Ctrl+Alt+M` ou clique **Marcar confirmação**. Faça as três viagens dentro da janela de captura, se possível.
-4. Se a marca falhar ou quiser repetir, clique **Recomeçar viagem (descartar atual)**. O contador de marcas e os registros da tentativa atual são zerados assim que as chamadas em curso terminarem; não precisa reiniciar o jogo.
-5. Depois do carregamento, espere a captura parar e clique **Salvar viagem**. Você pode iniciar outra captura na mesma sessão. Cada arquivo salvo recebe um nome numerado; iniciar outra captura sem salvar descarta os registros anteriores.
+## O que o resultado responde
 
-Os arquivos `baseline_v5_1.tsv`, `waypoint_v5_1.tsv`, `waypoint_v5_2.tsv` etc. ficam no diretório `WaypointProbe` fornecido pelo Nexus. Colunas: `phase`, `tick_ms`, `thread`, `api` (`E`, `P`, `S`, `T`, `M`), `bytes`, `scanned_bytes`, `id_1072_offset`, `id_1038_offset`, `gw2_rva_0` a `gw2_rva_11`. Offset vazio significa que a sequência não apareceu nos bytes examinados. `scanned_bytes < bytes` indica truncamento da busca. Se houver eventos descartados, a capacidade de 16.384 registros foi atingida.
+A sequência esperada é `DESTINATION 1072`, `CANCEL 1072`, `DESTINATION 1072`, `ACCEPT_ENTER 1072`, `ACCEPT_RETURN 1072`, `DESTINATION 1038`, `ACCEPT_ENTER 1038`, `ACCEPT_RETURN 1038`. Se aparecer, teremos identificado o caminho de confirmação e o campo do destino em execução. Isso permite concentrar a investigação na chamada de ação feita dentro desse tratamento, em vez de inferir viagens por tamanho de pacote.
 
-Abra ou remova colunas com um editor de texto que preserve identificadores hexadecimais. Planilhas podem converter endereços contendo `E` em notação científica.
+Se não aparecer, a sonda informa se os hooks instalaram, se as leituras falharam ou se outro caminho foi usado. Esse resultado também pode descartar a hipótese do diálogo.
+
+## TSV
+
+Colunas: `event`, `tick_ms`, `thread`, `waypoint_id`, `read_ok`, `control_id`, `event_subtype`, `setup_active`, `event_active`, `dropped`, `gw2_rva_0` a `gw2_rva_5`.
+
+A linha `STATUS` indica os hooks ativos e a quantidade descartada; os campos de destino e botão dela são zero. Os endereços têm prefixo `0x` para reduzir conversões indevidas por planilhas. A capacidade é de 1024 eventos. Nenhuma coluna de payload existe nesta versão.
+
+## Compatibilidade e limites
+
+A sonda exige timestamp PE `0x6ad7acf4`, imagem `0x02c49000` e os bytes iniciais exatos de cada rotina do executável fornecido. Atualizações podem desativar a captura. Usa `AF_DisableHotloading`. Os hooks são experimentais e precisam ser validados no jogo; os testes automatizados cobrem o carregamento da DLL, encaminhamento dos argumentos, leituras inválidas, reinício da captura, capacidade e formato do arquivo.
 
 ## Build
 
-O workflow `.github/workflows/waypoint-probe.yml` compila com MSVC x64, CMake e versões fixadas dos headers Nexus e ImGui. Executa um smoke test de carregamento e exportação da DLL. Nenhum código do Event Timers principal foi modificado.
+O workflow `.github/workflows/waypoint-probe.yml` compila com MSVC x64 no Windows e executa os testes. Os headers Nexus e o ImGui têm commits fixados no CMake. O addon principal não foi modificado.

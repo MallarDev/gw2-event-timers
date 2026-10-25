@@ -1,402 +1,223 @@
-#include <winsock2.h>
 #include <windows.h>
 #include "Nexus.h"
 #include "imgui.h"
-
-#include <algorithm>
 #include <array>
 #include <atomic>
 #include <cstdint>
-#include <climits>
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <mutex>
 #include <string>
+#include <vector>
 
 namespace {
 constexpr DWORD expectedTimestamp = 0x6ad7acf4;
 constexpr DWORD expectedImageSize = 0x02c49000;
-constexpr size_t capacity = 16384;
-constexpr int framesPerCall = 12;
-constexpr size_t maxScanBytes = 2048;
-constexpr const char* windowName = "Waypoint Probe###MALLARD_WAYPOINT_PROBE";
-constexpr const char* markerBind = "MALLARD_WAYPOINT_PROBE_MARK";
-constexpr size_t preSendRva = 0x00fe9e60;
-constexpr unsigned char preSendBytes[] = {0x48, 0x8b, 0x49, 0x30, 0x45, 0x8b, 0xc8,
-                                          0x4c, 0x8b, 0xc2, 0x41, 0x8b, 0xd1};
-constexpr size_t transformRva = 0x00ff4dc0;
-constexpr unsigned char transformBytes[] = {0x48, 0x89, 0x5c, 0x24, 0x10, 0x57, 0x44, 0x8b,
-                                             0x11, 0x49, 0x8b, 0xd9, 0x44, 0x8b, 0x59, 0x04};
-constexpr unsigned char waypointA[] = {0x30, 0x04, 0x00, 0x00}; // 1072
-constexpr unsigned char waypointB[] = {0x0e, 0x04, 0x00, 0x00}; // 1038
-using SendFn = int (WSAAPI*)(SOCKET, const char*, int, int);
-using SendToFn = int (WSAAPI*)(SOCKET, const char*, int, int, const sockaddr*, int);
-using PreSendFn = uintptr_t (*)(void*, const void*, unsigned);
-using TransformFn = void (*)(void*, unsigned, const void*, void*);
-
-struct Record {
-    std::atomic<bool> ready{false};
-    ULONGLONG tick{};
-    DWORD thread{};
-    unsigned char phase{};
-    char kind{};
-    int length{};
-    uint16_t scannedBytes{};
-    int offsetA{-1};
-    int offsetB{-1};
-    std::array<uint64_t, framesPerCall> rva{};
-};
-std::array<Record, capacity> records{};
-std::atomic<size_t> nextRecord{0};
-std::atomic<unsigned> inFlight{0};
-std::atomic<unsigned> activePhase{0};
-std::atomic<ULONGLONG> deadline{0};
-std::atomic<unsigned> dropped{0};
-std::atomic<unsigned> markers{0};
+constexpr size_t capacity = 1024;
+constexpr size_t setupRva = 0x004f0160;
+constexpr size_t eventRva = 0x004efe30;
+constexpr unsigned char setupBytes[] = {0x48,0x89,0x5c,0x24,0x10,0x48,0x89,0x74,0x24,0x18,0x48,0x89,0x7c,0x24,0x20,0x55};
+constexpr unsigned char eventBytes[] = {0x40,0x53,0x48,0x83,0xec,0x40,0x48,0x8b,0x05,0x83,0x3d,0x0a,0x02,0x48,0x33,0xc4};
+using SetupFn = void (*)(void*, const void*);
+using EventFn = void (*)(void*, const void*);
+SetupFn originalSetup = nullptr;
+EventFn originalEvent = nullptr;
 AddonAPI_t* api = nullptr;
 HMODULE host = nullptr;
 size_t hostSize = 0;
-void** sendSlot = nullptr;
-void** sendToSlot = nullptr;
-SendFn originalSend = nullptr;
-SendToFn originalSendTo = nullptr;
-PreSendFn originalPreSend = nullptr;
-void* preSendAddress = nullptr;
-bool preSendHooked = false;
-TransformFn originalTransform = nullptr;
-void* transformAddress = nullptr;
-bool transformHooked = false;
-bool visible = true;
-bool restartPending = false;
-bool supported = false;
-bool hooked = false;
-unsigned lastCapturedPhase = 0;
+bool setupHooked = false, eventHooked = false, supported = false, visible = true;
+std::atomic<bool> capturing{false};
+std::mutex captureMutex;
+unsigned session = 0, dropped = 0, savedNumber = 0;
+bool saved = true;
+ULONGLONG deadline = 0;
 std::filesystem::path directory;
 std::string status;
+struct Record {
+    ULONGLONG tick{};
+    DWORD thread{};
+    const char* event{};
+    uint32_t waypoint{}, control{}, subtype{};
+    bool readOk{};
+    std::array<uint64_t, 6> stack{};
+};
+std::vector<Record> records;
 
-bool supportedExecutable() {
-    host = GetModuleHandleW(nullptr);
-    if (!host) return false;
-    const auto* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(host);
-    if (dos->e_magic != IMAGE_DOS_SIGNATURE || dos->e_lfanew <= 0 || dos->e_lfanew > 4096) return false;
-    const auto* nt = reinterpret_cast<const IMAGE_NT_HEADERS64*>(reinterpret_cast<const char*>(host) + dos->e_lfanew);
-    if (nt->Signature != IMAGE_NT_SIGNATURE || nt->OptionalHeader.Magic != IMAGE_NT_OPTIONAL_HDR64_MAGIC) return false;
-    hostSize = nt->OptionalHeader.SizeOfImage;
-    return nt->FileHeader.TimeDateStamp == expectedTimestamp && hostSize == expectedImageSize;
+template<class T> bool readField(const void* object, size_t offset, T& out) {
+    if (!object || reinterpret_cast<uintptr_t>(object) > UINTPTR_MAX-offset) return false;
+    T value{};
+    SIZE_T copied = 0;
+    const bool ok = ReadProcessMemory(GetCurrentProcess(), reinterpret_cast<const void*>(reinterpret_cast<uintptr_t>(object)+offset),
+        &value, sizeof(T), &copied) && copied == sizeof(T);
+    out = ok ? value : T{};
+    return ok;
 }
-
-// Called once on the Nexus load thread. Only the main executable's imported functions are changed.
-void** findImport(const char* function, WORD ordinal) {
-    const auto* base = reinterpret_cast<const unsigned char*>(host);
-    const auto* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(base);
-    const auto* nt = reinterpret_cast<const IMAGE_NT_HEADERS64*>(base + dos->e_lfanew);
-    const auto& dir = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
-    if (!dir.VirtualAddress || dir.VirtualAddress >= hostSize || dir.Size < sizeof(IMAGE_IMPORT_DESCRIPTOR) ||
-        static_cast<size_t>(dir.VirtualAddress) + dir.Size > hostSize) return nullptr;
-    const auto* imports = reinterpret_cast<const IMAGE_IMPORT_DESCRIPTOR*>(base + dir.VirtualAddress);
-    const size_t count = dir.Size / sizeof(IMAGE_IMPORT_DESCRIPTOR);
-    for (size_t i = 0; i < count && imports[i].Name; ++i) {
-        const auto& imp = imports[i];
-        if (imp.Name >= hostSize || !imp.OriginalFirstThunk || !imp.FirstThunk ||
-            imp.OriginalFirstThunk >= hostSize || imp.FirstThunk >= hostSize) continue;
-        if (_stricmp(reinterpret_cast<const char*>(base + imp.Name), "WS2_32.dll") != 0) continue;
-        const auto* names = reinterpret_cast<const IMAGE_THUNK_DATA64*>(base + imp.OriginalFirstThunk);
-        auto* slots = reinterpret_cast<IMAGE_THUNK_DATA64*>(const_cast<unsigned char*>(base) + imp.FirstThunk);
-        const size_t n = (hostSize - imp.OriginalFirstThunk) / sizeof(IMAGE_THUNK_DATA64);
-        const size_t m = (hostSize - imp.FirstThunk) / sizeof(IMAGE_THUNK_DATA64);
-        for (size_t j = 0; j < n && j < m && names[j].u1.AddressOfData; ++j) {
-            const auto value = names[j].u1.Ordinal;
-            const bool ordinalMatch = IMAGE_SNAP_BY_ORDINAL64(value) && IMAGE_ORDINAL64(value) == ordinal;
-            bool nameMatch = false;
-            if (!IMAGE_SNAP_BY_ORDINAL64(value) && value < hostSize && value + sizeof(IMAGE_IMPORT_BY_NAME) < hostSize) {
-                const auto* imported = reinterpret_cast<const IMAGE_IMPORT_BY_NAME*>(base + value);
-                nameMatch = std::strcmp(imported->Name, function) == 0;
-            }
-            if (ordinalMatch || nameMatch) return reinterpret_cast<void**>(&slots[j].u1.Function);
+Record makeRecord(const char* event) {
+    Record r{}; r.event=event; r.tick=GetTickCount64(); r.thread=GetCurrentThreadId();
+    void* frames[6]{};
+    const USHORT count = CaptureStackBackTrace(2, 6, frames, nullptr);
+    const uintptr_t base = reinterpret_cast<uintptr_t>(host);
+    for (USHORT i=0; i<count; ++i) {
+        const uintptr_t address = reinterpret_cast<uintptr_t>(frames[i]);
+        if (address >= base && address-base < hostSize) r.stack[i] = address-base;
+    }
+    return r;
+}
+unsigned captureSession() {
+    std::lock_guard<std::mutex> lock(captureMutex);
+    if (!capturing.load() || GetTickCount64() >= deadline) { capturing.store(false); return 0; }
+    return session;
+}
+void append(unsigned token, const Record& record) {
+    std::lock_guard<std::mutex> lock(captureMutex);
+    if (!token || session != token || !capturing.load() || GetTickCount64() >= deadline) return;
+    if (records.size() < capacity) records.push_back(record); else ++dropped;
+}
+void tracedSetup(void* dialog, const void* poi) {
+    if (capturing.load()) {
+        const unsigned token = captureSession();
+        Record r = makeRecord("DESTINATION");
+        r.readOk = readField(poi, 0x28, r.waypoint);
+        append(token, r);
+    }
+    originalSetup(dialog, poi);
+}
+void tracedEvent(void* dialog, const void* event) {
+    const unsigned token = capturing.load() ? captureSession() : 0;
+    Record r{};
+    if (token) {
+        uint32_t control = 0, subtype = 0;
+        const bool eventOk = readField(event, 4, control) && readField(event, 8, subtype);
+        // Only the two button branches used by this specific dialog, plus failed reads.
+        if (!eventOk || (subtype == 3 && (control == 0 || control == 1))) {
+            r = makeRecord(!eventOk ? "READ_FAILED" : control == 1 ? "ACCEPT_ENTER" : "CANCEL");
+            r.control=control; r.subtype=subtype;
+            const void* poi = nullptr;
+            r.readOk = eventOk && readField(dialog, 0x68, poi) && readField(poi, 0x28, r.waypoint);
+            append(token, r);
         }
     }
-    return nullptr;
-}
-
-bool replaceImport(void** slot, void* replacement, void** prior) {
-    DWORD protection = 0;
-    if (!VirtualProtect(slot, sizeof(void*), PAGE_READWRITE, &protection)) return false;
-    // Publish the original target before another thread can enter the hook.
-    *prior = *slot;
-    InterlockedExchangePointer(reinterpret_cast<void* volatile*>(slot), replacement);
-    DWORD unused = 0;
-    VirtualProtect(slot, sizeof(void*), protection, &unused);
-    return true;
-}
-
-void recordCall(char kind, int length, const void* data = nullptr) {
-    inFlight.fetch_add(1, std::memory_order_acq_rel);
-    const unsigned phase = activePhase.load(std::memory_order_acquire);
-    if (phase && activePhase.load(std::memory_order_acquire) == phase &&
-        GetTickCount64() < deadline.load(std::memory_order_acquire)) {
-        const size_t index = nextRecord.fetch_add(1, std::memory_order_relaxed);
-        if (index < capacity) {
-            Record& r = records[index];
-            r.ready.store(false, std::memory_order_relaxed);
-            r.tick = GetTickCount64();
-            r.thread = GetCurrentThreadId();
-            r.phase = static_cast<unsigned char>(phase);
-            r.kind = kind;
-            r.length = length;
-            r.scannedBytes = 0;
-            r.offsetA = -1;
-            r.offsetB = -1;
-            r.rva.fill(0);
-            if (kind == 'E' && data && length > 0) {
-                r.scannedBytes = static_cast<uint16_t>((std::min)(static_cast<size_t>(length), maxScanBytes));
-                const auto* input = static_cast<const unsigned char*>(data);
-                for (size_t n = 0; n + sizeof(waypointA) <= r.scannedBytes; ++n) {
-                    if (r.offsetA < 0 && std::memcmp(input + n, waypointA, sizeof(waypointA)) == 0)
-                        r.offsetA = static_cast<int>(n);
-                    if (r.offsetB < 0 && std::memcmp(input + n, waypointB, sizeof(waypointB)) == 0)
-                        r.offsetB = static_cast<int>(n);
-                }
-            }
-            if (kind != 'M') {
-                void* stack[framesPerCall]{};
-                const USHORT count = CaptureStackBackTrace(2, framesPerCall, stack, nullptr);
-                const uintptr_t base = reinterpret_cast<uintptr_t>(host);
-                for (USHORT i = 0; i < count; ++i) {
-                    const uintptr_t p = reinterpret_cast<uintptr_t>(stack[i]);
-                    r.rva[i] = p >= base && p - base < hostSize ? static_cast<uint64_t>(p - base) : 0;
-                }
-            }
-            r.ready.store(true, std::memory_order_release);
-            if (kind == 'M') markers.fetch_add(1, std::memory_order_relaxed);
-        } else dropped.fetch_add(1, std::memory_order_relaxed);
+    // Preserve the original call exactly once, including unrecognized events.
+    originalEvent(dialog, event);
+    if (token && r.event && std::strcmp(r.event,"ACCEPT_ENTER")==0) {
+        // The original may destroy the dialog: never read it again after forwarding.
+        r.event="ACCEPT_RETURN"; r.tick=GetTickCount64();
+        append(token, r);
     }
-    inFlight.fetch_sub(1, std::memory_order_release);
 }
-
-int WSAAPI tracedSend(SOCKET socket, const char* data, int length, int flags) {
-    recordCall('S', length);
-    return originalSend(socket, data, length, flags);
+bool supportedExecutable() {
+    host=GetModuleHandleW(nullptr);
+    if (!host) return false;
+    const auto* dos=reinterpret_cast<const IMAGE_DOS_HEADER*>(host);
+    if (dos->e_magic!=IMAGE_DOS_SIGNATURE || dos->e_lfanew<=0 || dos->e_lfanew>4096) return false;
+    const auto* nt=reinterpret_cast<const IMAGE_NT_HEADERS64*>(reinterpret_cast<const char*>(host)+dos->e_lfanew);
+    if(nt->Signature!=IMAGE_NT_SIGNATURE || nt->OptionalHeader.Magic!=IMAGE_NT_OPTIONAL_HDR64_MAGIC) return false;
+    hostSize=nt->OptionalHeader.SizeOfImage;
+    return nt->FileHeader.TimeDateStamp==expectedTimestamp && hostSize==expectedImageSize;
 }
-int WSAAPI tracedSendTo(SOCKET socket, const char* data, int length, int flags, const sockaddr* address, int addressLength) {
-    recordCall('T', length);
-    return originalSendTo(socket, data, length, flags, address, addressLength);
+bool install(size_t rva, const unsigned char* signature, size_t size, void* replacement, void** original) {
+    if(rva+size>hostSize) return false;
+    auto* address=reinterpret_cast<unsigned char*>(host)+rva;
+    if(std::memcmp(address,signature,size)!=0) return false;
+    if(api->MinHook_Create(address,replacement,original)!=MH_OK) return false;
+    if(api->MinHook_Enable(address)==MH_OK) return true;
+    api->MinHook_Remove(address); *original=nullptr; return false;
 }
-
-uintptr_t tracedPreSend(void* object, const void* bytes, unsigned length) {
-    recordCall('P', static_cast<int>(length));
-    return originalPreSend(object, bytes, length);
+void start() {
+    std::lock_guard<std::mutex> lock(captureMutex);
+    capturing.store(false); ++session; if(!session) ++session;
+    records.clear(); dropped=0; saved=false;
+    deadline=GetTickCount64()+180000; capturing.store(true);
+    status="Captura iniciada por até 3 minutos. Abra A e cancele; abra A e confirme; abra B e confirme.";
 }
-
-void tracedTransform(void* state, unsigned length, const void* input, void* output) {
-    // Check fixed waypoint IDs before transformation; never retain message bytes.
-    recordCall('E', length <= INT_MAX ? static_cast<int>(length) : -1, input);
-    originalTransform(state, length, input, output);
-}
-
-void markConfirmation() {
-    if (activePhase.load(std::memory_order_acquire) != 2) {
-        status = "Inicie a captura de viagem antes de marcar a confirmação.";
-        return;
+void save() {
+    std::vector<Record> snapshot;
+    unsigned lost=0;
+    {
+        std::lock_guard<std::mutex> lock(captureMutex);
+        capturing.store(false);
+        if(saved) { status="Inicie uma nova captura antes de salvar."; return; }
+        snapshot=records; lost=dropped;
     }
-    recordCall('M', 0);
-}
-
-void onMarkerBind(const char*, bool release) {
-    if (!release && activePhase.load(std::memory_order_acquire) == 2) recordCall('M', 0);
-}
-
-void installPreSendHook() {
-    if (preSendRva + sizeof(preSendBytes) > hostSize) return;
-    preSendAddress = reinterpret_cast<unsigned char*>(host) + preSendRva;
-    if (std::memcmp(preSendAddress, preSendBytes, sizeof(preSendBytes)) != 0) return;
-    if (!api->MinHook_Create || !api->MinHook_Enable || !api->MinHook_Remove || !api->MinHook_Disable) return;
-    if (api->MinHook_Create(preSendAddress, reinterpret_cast<void*>(&tracedPreSend),
-                      reinterpret_cast<void**>(&originalPreSend)) != MH_OK) return;
-    if (api->MinHook_Enable(preSendAddress) == MH_OK) preSendHooked = true;
-    else { api->MinHook_Remove(preSendAddress); originalPreSend = nullptr; }
-}
-
-void installTransformHook() {
-    if (transformRva + sizeof(transformBytes) > hostSize) return;
-    transformAddress = reinterpret_cast<unsigned char*>(host) + transformRva;
-    if (std::memcmp(transformAddress, transformBytes, sizeof(transformBytes)) != 0) return;
-    if (!api->MinHook_Create || !api->MinHook_Enable || !api->MinHook_Remove || !api->MinHook_Disable) return;
-    if (api->MinHook_Create(transformAddress, reinterpret_cast<void*>(&tracedTransform),
-                      reinterpret_cast<void**>(&originalTransform)) != MH_OK) return;
-    if (api->MinHook_Enable(transformAddress) == MH_OK) transformHooked = true;
-    else { api->MinHook_Remove(transformAddress); originalTransform = nullptr; }
-}
-
-void stop() { activePhase.store(0, std::memory_order_release); }
-
-void save(unsigned phase) {
-    if (activePhase.load(std::memory_order_acquire) != 0) { status = "Pare a captura antes de salvar."; return; }
-    if (inFlight.load(std::memory_order_acquire) != 0) { status = "Aguardando chamadas pendentes; clique em salvar novamente."; return; }
-    if (lastCapturedPhase != phase) { status = "Nenhuma captura desse tipo pronta para salvar."; return; }
-    if (directory.empty()) { status = "Nexus não forneceu um diretório de captura."; return; }
+    if(directory.empty()) { status="Diretório de captura indisponível."; return; }
     try {
         std::filesystem::create_directories(directory);
-        const std::string prefix = phase == 1 ? "baseline_v5_" : "waypoint_v5_";
         std::filesystem::path path;
-        for (unsigned number = 1; number < 1000000; ++number) {
-            path = directory / (prefix + std::to_string(number) + ".tsv");
-            if (!std::filesystem::exists(path)) break;
-            path.clear();
-        }
-        if (path.empty()) { status = "Limite de nomes de captura atingido."; return; }
-        std::ofstream out(path, std::ios::trunc);
-        if (!out) { status = "Não foi possível abrir o arquivo de captura."; return; }
-        out << "phase\ttick_ms\tthread\tapi\tbytes\tscanned_bytes\tid_1072_offset\tid_1038_offset";
-        for (int i = 0; i < framesPerCall; ++i) out << "\tgw2_rva_" << i;
-        out << '\n';
-        size_t count = 0;
-        const size_t end = (std::min)(nextRecord.load(std::memory_order_acquire), capacity);
-        for (size_t i = 0; i < end; ++i) {
-            const Record& r = records[i];
-            if (!r.ready.load(std::memory_order_acquire) || r.phase != phase) continue;
-            out << static_cast<int>(r.phase) << '\t' << r.tick << '\t' << r.thread << '\t' << r.kind << '\t' << r.length;
-            out << '\t' << r.scannedBytes << '\t';
-            if (r.offsetA >= 0) out << r.offsetA;
-            out << '\t';
-            if (r.offsetB >= 0) out << r.offsetB;
-            for (const auto rva : r.rva) {
-                char hex[24]{};
-                if (rva) std::snprintf(hex, sizeof(hex), "%llX", static_cast<unsigned long long>(rva));
-                out << '\t' << hex;
-            }
-            out << '\n';
-            ++count;
+        do { path=directory/("waypoint_ui_v6_"+std::to_string(++savedNumber)+".tsv"); }
+        while(std::filesystem::exists(path));
+        std::ofstream out(path,std::ios::trunc);
+        if(!out) { status="Falha ao abrir arquivo para salvar."; return; }
+        out<<"event\ttick_ms\tthread\twaypoint_id\tread_ok\tcontrol_id\tevent_subtype\tsetup_active\tevent_active\tdropped";
+        for(int i=0;i<6;++i) out<<"\tgw2_rva_"<<i;
+        out<<'\n';
+        // Include hook health even when no candidate was hit.
+        out<<"STATUS\t"<<GetTickCount64()<<"\t0\t0\t0\t0\t0\t"<<setupHooked<<'\t'<<eventHooked<<'\t'<<lost;
+        for(int i=0;i<6;++i) out<<'\t';
+        out<<'\n';
+        for(const auto& r:snapshot) {
+            out<<r.event<<'\t'<<r.tick<<'\t'<<r.thread<<'\t'<<r.waypoint<<'\t'<<r.readOk<<'\t'<<r.control<<'\t'<<r.subtype<<'\t'<<setupHooked<<'\t'<<eventHooked<<'\t'<<lost;
+            for(const auto address:r.stack) { char hex[24]{}; if(address) std::snprintf(hex,sizeof(hex),"0x%llX",static_cast<unsigned long long>(address)); out<<'\t'<<hex; }
+            out<<'\n';
         }
         out.close();
-        if (!out) { status = "Falha ao terminar a gravação do arquivo."; return; }
-        lastCapturedPhase = 0;
-        status = "Salvos " + std::to_string(count) + " registros em " + path.u8string();
-    } catch (...) { status = "Falha ao salvar a captura no diretório do addon."; }
+        if(!out) { status="Falha ao terminar a gravação."; return; }
+        saved=true;
+        status="Salvos "+std::to_string(snapshot.size())+" eventos em "+path.u8string();
+    } catch(...) { status="Falha ao salvar a captura."; }
 }
-
-void start(unsigned phase, ULONGLONG seconds) {
-    if (activePhase.load(std::memory_order_acquire)) { status = "Pare a captura atual primeiro."; return; }
-    if (inFlight.load(std::memory_order_acquire)) { status = "Aguarde as chamadas pendentes."; return; }
-    nextRecord.store(0, std::memory_order_release);
-    dropped.store(0, std::memory_order_relaxed);
-    markers.store(0, std::memory_order_relaxed);
-    lastCapturedPhase = phase;
-    deadline.store(GetTickCount64() + seconds * 1000, std::memory_order_release);
-    activePhase.store(phase, std::memory_order_release);
-    status = phase == 1 ? "Registrando repouso por 10 segundos." : "Registrando viagem por 30 segundos. Viaje manualmente agora.";
-}
-
-void restartTravel() {
-    stop();
-    lastCapturedPhase = 0;
-    restartPending = true;
-    status = "Aguardando chamadas em curso para recomeçar a viagem.";
-}
-
 void render() {
-    if (!visible) return;
-    if (restartPending && inFlight.load(std::memory_order_acquire) == 0) {
-        start(2, 30);
-        if (activePhase.load(std::memory_order_acquire) == 2) {
-            restartPending = false;
-            status = "Nova captura de viagem iniciada; tentativa anterior descartada.";
+    if(!visible) return;
+    ImGui::SetNextWindowSize(ImVec2(720,300),ImGuiCond_FirstUseEver);
+    if(ImGui::Begin("Waypoint Probe v0.6###MALLARD_WAYPOINT_PROBE",&visible)) {
+        ImGui::TextWrapped("Observa o destino e os botões do diálogo de confirmação. Os eventos são registrados automaticamente.");
+        ImGui::Text("Destino: %s | confirmação: %s",setupHooked?"ativo":"indisponível",eventHooked?"ativa":"indisponível");
+        if(supported&&setupHooked&&eventHooked) {
+            if(ImGui::Button("Iniciar / recomeçar (descarta captura atual)")) start();
+            ImGui::SameLine(); if(ImGui::Button("Parar e salvar")) save();
         }
-    }
-    ImGui::SetNextWindowSize(ImVec2(680, 290), ImGuiCond_FirstUseEver);
-    if (ImGui::Begin(windowName, &visible)) {
-        ImGui::TextWrapped("Sonda de metadados. Verifica dois IDs antes da transformação; não salva bytes de mensagens.");
-        if (!supported) ImGui::TextWrapped("Executável diferente do GW2 fornecido: captura desativada.");
-        else if (!hooked) ImGui::TextWrapped("Não foi possível instalar a captura nos imports de WS2_32.");
-        else {
-            const unsigned phase = activePhase.load(std::memory_order_acquire);
-            if (phase && GetTickCount64() >= deadline.load(std::memory_order_acquire)) stop();
-            if (ImGui::Button("Capturar repouso (10 s)")) { restartPending = false; start(1, 10); }
-            ImGui::SameLine();
-            if (ImGui::Button("Capturar viagem (30 s)")) { restartPending = false; start(2, 30); }
-            ImGui::SameLine();
-            if (ImGui::Button("Parar")) { restartPending = false; stop(); }
-            if (ImGui::Button("Recomeçar viagem (descartar atual)")) restartTravel();
-            if (ImGui::Button("Salvar repouso")) save(1);
-            ImGui::SameLine();
-            if (ImGui::Button("Salvar viagem")) save(2);
-            if (ImGui::Button("Marcar confirmação (Ctrl+Alt+M)")) markConfirmation();
-            ImGui::Text("Estado: %s | chamadas: %zu / %zu | descartadas: %u",
-                activePhase.load() == 1 ? "repouso" : activePhase.load() == 2 ? "viagem" : "parado",
-                (std::min)(nextRecord.load(), capacity), capacity, dropped.load());
-            ImGui::Text("Marcas: %u | preparação de envio: %s", markers.load(),
-                preSendHooked ? "ativa" : "indisponível (send ainda ativo)");
-            ImGui::Text("Verificação anterior à transformação: %s", transformHooked ? "ativa" : "indisponível");
-            ImGui::TextWrapped("Você pode repetir as capturas sem reiniciar. Salvar cria um novo arquivo numerado.");
+        {
+            std::lock_guard<std::mutex> lock(captureMutex);
+            if(capturing.load()&&GetTickCount64()>=deadline) capturing.store(false);
+            ImGui::Text("Estado: %s | eventos: %zu | descartados: %u",capturing.load()?"capturando":"parado",records.size(),dropped);
+            if(!records.empty()) {
+                const auto& r=records.back();
+                ImGui::Text("Último: %s | destino: %u | leitura: %s",r.event,r.waypoint,r.readOk?"OK":"falhou");
+            }
         }
-        ImGui::Separator();
-        ImGui::TextWrapped("%s", status.c_str());
+        ImGui::TextWrapped("Teste: A → cancelar pelo botão; A → confirmar; B → confirmar. Não precisa marcar nem apertar atalho.");
+        ImGui::Separator(); ImGui::TextWrapped("%s",status.c_str());
     }
     ImGui::End();
 }
-
-void options() {
-    if (ImGui::Button("Abrir Waypoint Probe")) visible = true;
-    ImGui::TextWrapped("Marque a confirmação com Ctrl+Alt+M imediatamente antes de clicar em Viajar. As capturas ficam no diretório WaypointProbe dos addons do Nexus.");
-}
-
+void options() { if(ImGui::Button("Abrir Waypoint Probe v0.6")) visible=true; }
 void load(AddonAPI_t* nexus) {
-    api = nexus;
+    api=nexus;
     ImGui::SetCurrentContext(static_cast<ImGuiContext*>(api->ImguiContext));
-    ImGui::SetAllocatorFunctions(reinterpret_cast<void*(*)(size_t, void*)>(api->ImguiMalloc),
-                                 reinterpret_cast<void(*)(void*, void*)>(api->ImguiFree));
-    try { directory = std::filesystem::u8path(api->Paths_GetAddonDirectory("WaypointProbe")); }
-    catch (...) { directory.clear(); }
-    supported = supportedExecutable();
-    if (directory.empty()) status = "Nexus não forneceu um diretório de captura.";
-    if (supported) {
-        installPreSendHook();
-        installTransformHook();
-        sendSlot = findImport("send", 19);
-        sendToSlot = findImport("sendto", 20);
-        if (sendSlot && replaceImport(sendSlot, reinterpret_cast<void*>(&tracedSend), reinterpret_cast<void**>(&originalSend))) {
-            hooked = true;
-            if (sendToSlot && !replaceImport(sendToSlot, reinterpret_cast<void*>(&tracedSendTo), reinterpret_cast<void**>(&originalSendTo)))
-                status = "Apenas send foi instrumentado; sendto indisponível.";
-        }
-        if (!hooked) status = "Import send não encontrado ou não modificável.";
-    } else status = "Assinatura do executável não corresponde ao arquivo analisado.";
-    api->InputBinds_RegisterWithString(markerBind, onMarkerBind, "CTRL+ALT+M");
-    api->GUI_Register(RT_Render, render);
-    api->GUI_Register(RT_OptionsRender, options);
+    ImGui::SetAllocatorFunctions(reinterpret_cast<void*(*)(size_t,void*)>(api->ImguiMalloc),reinterpret_cast<void(*)(void*,void*)>(api->ImguiFree));
+    records.reserve(capacity);
+    try { const char* path=api->Paths_GetAddonDirectory("WaypointProbe"); if(path) directory=std::filesystem::u8path(path); } catch(...) {}
+    supported=supportedExecutable();
+    if(supported&&api->MinHook_Create&&api->MinHook_Enable&&api->MinHook_Disable&&api->MinHook_Remove) {
+        setupHooked=install(setupRva,setupBytes,sizeof(setupBytes),reinterpret_cast<void*>(&tracedSetup),reinterpret_cast<void**>(&originalSetup));
+        eventHooked=install(eventRva,eventBytes,sizeof(eventBytes),reinterpret_cast<void*>(&tracedEvent),reinterpret_cast<void**>(&originalEvent));
+    }
+    status=setupHooked&&eventHooked?"Pronto para o teste de confirmação.":"Captura indisponível: versão/assinatura do executável ou instalação dos hooks não corresponde.";
+    api->GUI_Register(RT_Render,render); api->GUI_Register(RT_OptionsRender,options);
 }
-
 void unload() {
-    stop();
-    if (api) {
-        api->GUI_Deregister(render); api->GUI_Deregister(options);
-        api->InputBinds_Deregister(markerBind);
-    }
-    // Hotloading is disabled; this callback is reached as the game is shutting down.
-    void* ignored = nullptr;
-    if (sendSlot && originalSend) replaceImport(sendSlot, reinterpret_cast<void*>(originalSend), &ignored);
-    if (sendToSlot && originalSendTo) replaceImport(sendToSlot, reinterpret_cast<void*>(originalSendTo), &ignored);
-    if (preSendHooked) {
-        api->MinHook_Disable(preSendAddress);
-        api->MinHook_Remove(preSendAddress);
-    }
-    if (transformHooked) {
-        api->MinHook_Disable(transformAddress);
-        api->MinHook_Remove(transformAddress);
-    }
+    capturing.store(false);
+    api->GUI_Deregister(render); api->GUI_Deregister(options);
+    // AF_DisableHotloading: only remove while the game is shutting down.
+    if(setupHooked) { auto* p=reinterpret_cast<unsigned char*>(host)+setupRva; api->MinHook_Disable(p); api->MinHook_Remove(p); }
+    if(eventHooked) { auto* p=reinterpret_cast<unsigned char*>(host)+eventRva; api->MinHook_Disable(p); api->MinHook_Remove(p); }
 }
 }
-
 extern "C" __declspec(dllexport) AddonDefinition_t* GetAddonDef() {
-    static AddonDefinition_t definition{};
-    definition.Signature = static_cast<uint32_t>(-1847302962);
-    definition.APIVersion = NEXUS_API_VERSION;
-    definition.Name = "Waypoint Probe";
-    definition.Author = "Mallard";
-    definition.Description = "Metadados de envio e verificação de IDs antes da transformação.";
-    definition.Version = {0, 5, 0, 0};
-    definition.Load = load; definition.Unload = unload;
-    definition.Flags = AF_DisableHotloading;
-    definition.Provider = UP_None;
-    return &definition;
+    static AddonDefinition_t d{};
+    d.Signature=static_cast<uint32_t>(-1847302962); d.APIVersion=NEXUS_API_VERSION;
+    d.Name="Waypoint Probe"; d.Author="Mallard"; d.Description="Observa seleção e confirmação de waypoint na interface.";
+    d.Version={0,6,0,0}; d.Load=load; d.Unload=unload; d.Flags=AF_DisableHotloading; d.Provider=UP_None;
+    return &d;
 }
