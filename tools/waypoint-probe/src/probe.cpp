@@ -268,9 +268,12 @@ void render() {
             const bool ready=canDirect(id);
             DWORD manualThread=0;
             { std::lock_guard<std::mutex> lock(captureMutex); manualThread=verified[i].thread; }
-            ImGui::BeginDisabled(!ready);
-            if(ImGui::Button(i==0?"Viajar direto para A (teste)":"Viajar direto para B (teste)")) directTravel(id);
-            ImGui::EndDisabled();
+            // Nexus's pinned ImGui predates BeginDisabled. Draw muted buttons and
+            // ignore activation unless the independent native-call gate passes.
+            if(!ready) ImGui::PushStyleVar(ImGuiStyleVar_Alpha,ImGui::GetStyle().Alpha*0.4f);
+            const bool clicked=ImGui::Button(i==0?"Viajar direto para A (teste)":"Viajar direto para B (teste)");
+            if(!ready) ImGui::PopStyleVar();
+            if(clicked && ready) directTravel(id);
             ImGui::SameLine(); ImGui::Text("Thread manual validada: %u",manualThread);
         }
         ImGui::TextWrapped("Primeiro viaje manualmente para A e B. Se os botões liberarem, teste A e depois B, aguardando cada chegada. Se ficarem desativados, salve o registro.");
