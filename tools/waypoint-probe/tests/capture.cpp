@@ -2,6 +2,7 @@
 #include <iostream>
 #include <algorithm>
 #include <iterator>
+#include <thread>
 
 namespace {
 unsigned setupCalls=0, eventCalls=0;
@@ -11,6 +12,13 @@ bool forwarded=true, simulateRequest=false;
 unsigned simpleCalls=0, routedCalls=0;
 uint32_t lastSimple=0, lastRouted=0;
 const void* lastRoute=nullptr;
+std::atomic<unsigned> asyncCalls{0};
+std::atomic<DWORD> asyncThread{0};
+void queuedSimple(uint32_t) { ++asyncCalls; asyncThread.store(GetCurrentThreadId()); }
+LRESULT CALLBACK testWindowProc(HWND window,UINT message,WPARAM wParam,LPARAM lParam) {
+    if(onWindowMessage(window,message,wParam,lParam)==0) return 0;
+    return DefWindowProcW(window,message,wParam,lParam);
+}
 void fakeSimple(uint32_t id) { ++simpleCalls; lastSimple=id; }
 void fakeRouted(uint32_t id,const void* route) { ++routedCalls; lastRouted=id; lastRoute=route; }
 void fakeSetup(void* dialog,const void* argument) {
@@ -56,12 +64,12 @@ int main() {
     start(); for(size_t i=0;i<capacity+3;++i) append(session,old);
     CHECK(records.size()==capacity && dropped==3);
     directory=std::filesystem::temp_directory_path()/("waypoint_probe_test_"+std::to_string(GetCurrentProcessId()));
-    save(); CHECK(saved && std::filesystem::exists(directory/"waypoint_request_v7_1.tsv"));
-    std::ifstream in(directory/"waypoint_request_v7_1.tsv");
+    save(); CHECK(saved && std::filesystem::exists(directory/"waypoint_request_v8_1.tsv"));
+    std::ifstream in(directory/"waypoint_request_v8_1.tsv");
     std::string row; size_t rows=0;
-    while(std::getline(in,row)) { CHECK(std::count(row.begin(),row.end(),'\t')==21); ++rows; }
+    while(std::getline(in,row)) { CHECK(std::count(row.begin(),row.end(),'\t')==23); ++rows; }
     CHECK(rows==capacity+2); in.close();
-    start(); save(); CHECK(std::filesystem::exists(directory/"waypoint_request_v7_2.tsv"));
+    start(); save(); CHECK(std::filesystem::exists(directory/"waypoint_request_v8_2.tsv"));
     std::filesystem::remove_all(directory);
     // Simulate an active connection and verify that direct calls require a matching
     // native sender invocation nested inside the real confirmation wrapper.
@@ -97,5 +105,58 @@ int main() {
     nextDirectAt=0; directTravel(999); CHECK(simpleCalls==before+1); // fixed allowlist
     start(); CHECK(!canDirect(1072)); // reset invalidates previous manual verification
     deadline=0; CHECK(!canDirect(1072));
-    std::cout<<"Forwarding, capture, correlation, direct-call gates and TSV verified\n";
+    // Actual Windows message dispatch: a worker stands in for the renderer,
+    // and the test's window thread stands in for the game's verified UI thread.
+    const HINSTANCE instance=GetModuleHandleW(nullptr);
+    WNDCLASSW wc{}; wc.hInstance=instance; wc.lpfnWndProc=testWindowProc;
+    wc.lpszClassName=L"WaypointProbeQueueTest";
+    CHECK(RegisterClassW(&wc)!=0);
+    dispatchMessage=RegisterWindowMessageW(L"Mallard.WaypointProbe.Dispatch.v8.Test");
+    CHECK(dispatchMessage!=0); windowCallbackRegistered=true;
+    const HWND window=CreateWindowExW(0,wc.lpszClassName,L"",0,0,0,0,0,HWND_MESSAGE,nullptr,instance,nullptr);
+    CHECK(window!=nullptr && windowThread.load()==GetCurrentThreadId());
+    originalSimple=queuedSimple;
+    start(); verified[0]={GetCurrentThreadId(),connectionPointer};
+    CHECK(canQueue(1072));
+    std::thread renderer([] { queueTravel(1072); }); renderer.join();
+    CHECK(asyncCalls.load()==0 && pendingActive.load());
+    const auto queued=pendingTravel;
+    // An unrelated ticket must neither execute nor consume the real pending job.
+    CHECK(onWindowMessage(window,dispatchMessage,queued.ticket+1,queued.capture)==0);
+    CHECK(pendingActive.load() && asyncCalls.load()==0);
+    MSG message{};
+    CHECK(PeekMessageW(&message,window,dispatchMessage,dispatchMessage,PM_REMOVE)!=0);
+    DispatchMessageW(&message);
+    CHECK(asyncCalls.load()==1 && asyncThread.load()==GetCurrentThreadId() && !pendingActive.load());
+    CHECK(std::strcmp(records.back().event,"DIRECT_RETURN")==0);
+    DispatchMessageW(&message); CHECK(asyncCalls.load()==1); // no replay
+    start(); verified[0]={GetCurrentThreadId()+1,connectionPointer};
+    CHECK(!canQueue(1072));
+    // Stopping/restarting a capture invalidates a queued command.
+    start(); verified[0]={GetCurrentThreadId(),connectionPointer};
+    std::thread staleRenderer([] { queueTravel(1072); }); staleRenderer.join();
+    CHECK(pendingActive.load()); start();
+    CHECK(PeekMessageW(&message,window,dispatchMessage,dispatchMessage,PM_REMOVE)!=0);
+    DispatchMessageW(&message); CHECK(asyncCalls.load()==1 && !pendingActive.load());
+    // The connection must be checked again at dispatch, not just at the button.
+    start(); verified[0]={GetCurrentThreadId(),connectionPointer};
+    std::thread disconnectedRenderer([] { queueTravel(1072); }); disconnectedRenderer.join();
+    connection[0]=0;
+    CHECK(PeekMessageW(&message,window,dispatchMessage,dispatchMessage,PM_REMOVE)!=0);
+    DispatchMessageW(&message); CHECK(asyncCalls.load()==1);
+    CHECK(std::strcmp(records.back().event,"DIRECT_REJECT")==0); connection[0]=4;
+    // A delayed request must expire without invoking the sender.
+    start(); verified[0]={GetCurrentThreadId(),connectionPointer};
+    std::thread delayedRenderer([] { queueTravel(1072); }); delayedRenderer.join();
+    pendingTravel.expiresAt=0;
+    CHECK(PeekMessageW(&message,window,dispatchMessage,dispatchMessage,PM_REMOVE)!=0);
+    DispatchMessageW(&message); CHECK(asyncCalls.load()==1 && !pendingActive.load());
+    CHECK(std::strcmp(records.back().event,"DISPATCH_REJECT")==0);
+    CHECK(onWindowMessage(window,WM_NULL,0,0)==1);
+    start(); const auto staleCapture=session; start();
+    verified[0]={GetCurrentThreadId(),connectionPointer};
+    directTravel(1072,staleCapture); CHECK(asyncCalls.load()==1);
+    DestroyWindow(window); UnregisterClassW(wc.lpszClassName,instance);
+    CHECK(!canQueue(1072));
+    std::cout<<"Capture, native-call gates and cross-thread Windows queue verified\n";
 }

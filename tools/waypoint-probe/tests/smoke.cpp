@@ -14,7 +14,7 @@ int main(int argc, char** argv) {
         definition->Signature == static_cast<uint32_t>(-1847302962) &&
         std::strcmp(definition->Name, "Waypoint Probe") == 0 &&
         definition->Load && definition->Unload && definition->Flags == AF_DisableHotloading &&
-        definition->Provider == UP_None && definition->Version.Major == 0 && definition->Version.Minor == 7;
+        definition->Provider == UP_None && definition->Version.Major == 0 && definition->Version.Minor == 8;
     FreeLibrary(library);
     if (!valid) return 4;
     std::cout << "Nexus definition and DLL export verified\n";

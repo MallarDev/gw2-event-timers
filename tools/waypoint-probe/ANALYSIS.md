@@ -25,3 +25,17 @@ Runtime discrimination: open A/cancel, open A/accept and arrive, open B/accept a
 - Getter 0x23f640 simply returns global pointer at image RVA 0x266c1d0. Dispatcher 0xff0110 proceeds only when connection DWORD +0x108 equals 3 and flag byte +0 has bit 4 set. v0.7 repeats these scalar checks before enabling a user direct call; no memory dump is recorded.
 
 v0.7 observes native builders to validate the final ID and correlate the sender with confirmation. An optional direct user button is available only for each allowlisted ID after a matching manual simple call in this capture, same thread and connection identity, active connection, all hooks healthy, active capture, and 5-second spacing. Routed calls cannot unlock a direct button. This allows a single runtime session to validate the actual sender and, where prerequisites match, test direct travel. No automatic calls occur upon observation.
+
+
+## v0.7 runtime evidence and queued UI-thread dispatch
+
+`waypoint_request_v7_1.tsv`: REQUEST_SIMPLE 1072 and 1038 both correlated with matching confirmations (`correlated=1`, `connection_active=1`), thread 480. Render thread is 1072. All hooks active and zero drops. No DIRECT events: the render-thread equality guard correctly prevented invocation from that thread.
+
+v0.8 queues the explicit button request with PostMessageW to the game window observed through Nexus's registered WndProc callback. At dispatch it checks the owning process and thread against the manually observed thread, capture epoch, ticket, window, 5-second expiry, native sender validation, active connection identity and debounce. No game function is invoked by the renderer. Requests are single-use and are canceled by capture restart/save. The callback consumes only the addon's registered message.
+
+Nexus source checked at commit 47a5b220e1f173624dd494190c3d3f2f17c8dd5d:
+- `Nexus/Hooks/Hooks.cpp`: Detour::WndProc calls RawInputApi::WndProc before GUI/input handling, and returns if it reports consumption. WndProc hooks the swapchain's output window.
+- `Nexus/Platform/RawInput/RiApi.cpp`: calls registered addon callbacks synchronously in WndProc and treats return 0 as consumption. The addon uses a registered private message, not WndProc_SendToGameOnly, which would bypass it.
+- Source: https://github.com/RaidcoreGG/Nexus/tree/47a5b220e1f173624dd494190c3d3f2f17c8dd5d
+
+A Windows integration test creates a message-only window on one thread and enqueues from another, verifies no native sender is called before DispatchMessage, then checks exactly one call on the window thread. It also rejects wrong tickets, duplicate delivery, reset captures, inactive connections and expired requests. Runtime Wine/Nexus delivery and actual travel remain to validate.
