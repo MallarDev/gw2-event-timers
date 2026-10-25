@@ -21,6 +21,19 @@ pub fn waypoint_id(link: &str) -> Option<u32> {
     (id != 0).then_some(id)
 }
 
+/// An event may list alternative waypoints. The first valid map link is its primary destination.
+pub fn first_waypoint_link(text: &str) -> Option<&str> {
+    let mut remaining = text;
+    while let Some(start) = remaining.find("[&") {
+        let candidate = &remaining[start..];
+        let Some(end) = candidate.find(']') else { return None; };
+        let link = &candidate[..=end];
+        if waypoint_id(link).is_some() { return Some(link); }
+        remaining = &candidate[end+1..];
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -35,4 +48,11 @@ mod tests {
             assert_eq!(waypoint_id(invalid), None, "{invalid:?}");
         }
     }
+    #[test]
+    fn alternatives_use_first_waypoint_while_non_map_text_is_ignored() {
+        assert_eq!(first_waypoint_link("[&BDAEAAA=] or [&BA4EAAA=]"), Some("[&BDAEAAA=]"));
+        assert_eq!(first_waypoint_link("[&AgAAAAA=] [&BA4EAAA=]"), Some("[&BA4EAAA=]"));
+        assert_eq!(first_waypoint_link("/wiki Defeat the invading Awakened"), None);
+    }
+
 }

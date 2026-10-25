@@ -355,6 +355,9 @@ pub fn render_settings(ui: &Ui) {
             }
             _ => {}
         }
+        if config.waypoint_click_action != crate::config::WaypointClickAction::Copy {
+            ui.text_disabled("For events with several waypoint links, uses the first listed waypoint.");
+        }
         ui.checkbox(
             "Include event name when copying waypoint",
             &mut config.copy_with_event_name,

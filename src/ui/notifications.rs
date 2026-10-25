@@ -143,7 +143,7 @@ fn render_single_toast(
             // Click hint if copy_text available
             if !toast.copy_text.is_empty() {
                 ui.set_window_font_scale(scale * 0.7);
-                ui.text_colored([0.5, 0.5, 0.5, 1.0], crate::waypoint_actions::hint(click_action));
+                ui.text_colored([0.5, 0.5, 0.5, 1.0], crate::waypoint_actions::hint(click_action, &toast.copy_text));
             }
 
             ui.set_window_font_scale(1.0);
@@ -374,7 +374,7 @@ pub fn render_upcoming_panel(ui: &Ui) {
                         if !event.copy_text.is_empty() {
                             ui.text(format!("Waypoint: {}", event.copy_text));
                             ui.separator();
-                            ui.text_disabled(crate::waypoint_actions::hint(click_action));
+                            ui.text_disabled(crate::waypoint_actions::hint(click_action, &event.copy_text));
                         }
                         ui.text_disabled("Right-click for options");
                     });

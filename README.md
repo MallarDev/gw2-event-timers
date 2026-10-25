@@ -8,6 +8,8 @@ Settings → Other → **Left-click on an event** has three choices:
 - **Open map at waypoint (requires Pie UI)**: opens the game's map at that waypoint through the optional Pie UI addon. Travel is confirmed in GW2.
 - **Copy waypoint**: copies the link, including the event name when that setting is enabled.
 
+When an event lists several waypoint links, teleporting and opening the map use its first listed valid waypoint; copying preserves the complete text. Events containing only a wiki command have no destination and cannot start travel.
+
 The choice applies to timeline events, actual event notification toasts and the Upcoming Events panel. Existing saved choices are preserved; the default remains Open map. A toast preview in settings only demonstrates copying and cannot initiate travel. If the selected action is unavailable, an alert explains why; it does not silently perform a different action.
 
 ### Install

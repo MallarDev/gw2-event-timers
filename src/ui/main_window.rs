@@ -26,6 +26,7 @@ thread_local! {
     static CACHED_FAVORITE_BY_TRACK: RefCell<StdHashMap<String, StdHashSet<String>>> = RefCell::new(StdHashMap::new());
     // Cached copy setting for the current frame
     static CACHED_COPY_WITH_EVENT_NAME: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static CACHED_WAYPOINT_CLICK_ACTION: std::cell::Cell<WaypointClickAction> = const { std::cell::Cell::new(WaypointClickAction::OpenMap) };
     // Track ESC key state for debouncing
     static ESC_WAS_DOWN: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
@@ -112,7 +113,7 @@ pub fn render_main_window(ui: &Ui) {
     let label_bg_color = config.label_column_bg_color;
     let label_text_color = config.label_column_text_color;
     let label_category_color = config.label_column_category_color;
-    let waypoint_click_action = config.waypoint_click_action;
+    CACHED_WAYPOINT_CLICK_ACTION.with(|c| c.set(config.waypoint_click_action));
 
     // Calculate time ONCE per frame
     let current_time = get_current_unix_time();
@@ -234,7 +235,7 @@ pub fn render_main_window(ui: &Ui) {
                             .map(|ev| ev.copy_text.as_str())
                         {
                             if crate::pie_ui::available() && MenuItem::new("Open waypoint on map (Pie UI)").build(ui) {
-                                crate::pie_ui::open_waypoint(link);
+                                crate::waypoint_actions::perform(ui, WaypointClickAction::OpenMap, &event_name, link, false);
                             }
                             if !link.is_empty() && MenuItem::new("Copy waypoint link").build(ui) {
                                 ui.set_clipboard_text(link);
@@ -1210,6 +1211,7 @@ fn handle_track_tooltip(
     _available_width: f32,
     pixels_per_second: f32,
 ) {
+    let waypoint_click_action = CACHED_WAYPOINT_CLICK_ACTION.with(|c| c.get());
     let mouse_pos = ui.io().mouse_pos;
     let mouse_x = mouse_pos[0];
     let elapsed_since_base = current_time - track.base_time;
@@ -1284,7 +1286,7 @@ fn handle_track_tooltip(
                     ui.text(&timing_text);
                     if !event.copy_text.is_empty() {
                         ui.separator();
-                        ui.text(crate::waypoint_actions::hint(waypoint_click_action));
+                        ui.text(crate::waypoint_actions::hint(waypoint_click_action, &event.copy_text));
                     }
                 });
 
