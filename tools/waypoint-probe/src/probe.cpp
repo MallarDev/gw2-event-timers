@@ -20,6 +20,22 @@ constexpr size_t setupRva = 0x004f0160;
 constexpr size_t eventRva = 0x004efe30;
 constexpr unsigned char setupBytes[] = {0x48,0x89,0x5c,0x24,0x10,0x48,0x89,0x74,0x24,0x18,0x48,0x89,0x7c,0x24,0x20,0x55};
 constexpr unsigned char eventBytes[] = {0x40,0x53,0x48,0x83,0xec,0x40,0x48,0x8b,0x05,0x83,0x3d,0x0a,0x02,0x48,0x33,0xc4};
+constexpr size_t simpleRva = 0x01263c70;
+constexpr size_t routedRva = 0x01263cc0;
+constexpr size_t connectionSlotRva = 0x0266c1d0;
+constexpr unsigned char simpleBytes[] = {0x40,0x53,0x48,0x83,0xec,0x20,0x8b,0xd9,0x85,0xc9,0x75,0x19,0x41,0xb8,0x12,0x39};
+constexpr unsigned char routedBytes[] = {0x48,0x89,0x5c,0x24,0x18,0x57,0x48,0x83,0xec,0x40,0x48,0x8b,0x05,0xef,0xfe,0x32};
+using SimpleFn = void (*)(uint32_t);
+using RoutedFn = void (*)(uint32_t, const void*);
+SimpleFn originalSimple = nullptr;
+RoutedFn originalRouted = nullptr;
+bool simpleHooked = false, routedHooked = false;
+thread_local uint32_t scopedWaypoint = 0;
+struct Verification { DWORD thread{}; const void* connection{}; };
+std::array<Verification,2> verified{};
+constexpr std::array<uint32_t,2> testWaypoints{1072,1038};
+ULONGLONG nextDirectAt = 0;
+DWORD renderThread = 0;
 using SetupFn = void (*)(void*, const void*);
 using EventFn = void (*)(void*, const void*);
 SetupFn originalSetup = nullptr;
@@ -40,7 +56,8 @@ struct Record {
     DWORD thread{};
     const char* event{};
     uint32_t waypoint{}, control{}, subtype{};
-    bool readOk{};
+    bool readOk{}, correlated{}, connected{};
+    uint32_t confirmation{};
     std::array<uint64_t, 6> stack{};
 };
 std::vector<Record> records;
@@ -70,10 +87,63 @@ unsigned captureSession() {
     if (!capturing.load() || GetTickCount64() >= deadline) { capturing.store(false); return 0; }
     return session;
 }
-void append(unsigned token, const Record& record) {
+bool append(unsigned token, const Record& record) {
     std::lock_guard<std::mutex> lock(captureMutex);
-    if (!token || session != token || !capturing.load() || GetTickCount64() >= deadline) return;
-    if (records.size() < capacity) records.push_back(record); else ++dropped;
+    if (!token || session != token || !capturing.load() || GetTickCount64() >= deadline) return false;
+    if (records.size() >= capacity) { ++dropped; return false; }
+    records.push_back(record); return true;
+}
+bool connectionState(const void*& connection) {
+    connection=nullptr;
+    if(!host || connectionSlotRva+sizeof(void*)>hostSize ||
+       !readField(host,connectionSlotRva,connection) || !connection) return false;
+    uint32_t state=0; unsigned char flags=0;
+    return readField(connection,0x108,state) && readField(connection,0,flags) && state==3 && (flags&4)!=0;
+}
+void observeRequest(const char* kind,uint32_t id,bool simple) {
+    const unsigned token=capturing.load()?captureSession():0;
+    if(!token) return;
+    Record r=makeRecord(kind); r.waypoint=id; r.readOk=true;
+    r.confirmation=scopedWaypoint; r.correlated=scopedWaypoint!=0 && scopedWaypoint==id;
+    const void* connection=nullptr; r.connected=connectionState(connection);
+    if(append(token,r) && simple && r.correlated && r.connected) {
+        std::lock_guard<std::mutex> lock(captureMutex);
+        if(session==token && capturing.load())
+            for(size_t i=0;i<testWaypoints.size();++i)
+                if(id==testWaypoints[i]) verified[i]={r.thread,connection};
+    }
+}
+void tracedSimple(uint32_t id) {
+    observeRequest("REQUEST_SIMPLE",id,true);
+    originalSimple(id);
+}
+void tracedRouted(uint32_t id,const void* route) {
+    // Forward the route unchanged. Its contents are never copied or logged.
+    observeRequest("REQUEST_ROUTED",id,false);
+    originalRouted(id,route);
+}
+bool canDirect(uint32_t id) {
+    if(!supported || !setupHooked || !eventHooked || !simpleHooked || !routedHooked || !originalSimple ||
+       !capturing.load() || !captureSession() || GetTickCount64()<nextDirectAt) return false;
+    const void* connection=nullptr;
+    if(!connectionState(connection)) return false;
+    std::lock_guard<std::mutex> lock(captureMutex);
+    for(size_t i=0;i<testWaypoints.size();++i)
+        if(id==testWaypoints[i] && verified[i].thread==GetCurrentThreadId() &&
+           verified[i].connection==connection) return true;
+    return false;
+}
+void directTravel(uint32_t id) {
+    if(!canDirect(id)) { status="Teste direto indisponível: destino, thread ou conexão ainda não validados."; return; }
+    const unsigned token=captureSession();
+    if(!token) return;
+    nextDirectAt=GetTickCount64()+5000;
+    Record r=makeRecord("DIRECT_ENTER"); r.waypoint=id; r.readOk=true; r.connected=true;
+    append(token,r);
+    // Only this user button invokes the verified native sender. Do not retain buffers or receiver objects.
+    originalSimple(id);
+    r.event="DIRECT_RETURN"; r.tick=GetTickCount64(); append(token,r);
+    status="Rotina nativa chamada para "+std::to_string(id)+". Confira se houve loading e chegada antes de outro teste.";
 }
 void tracedSetup(void* dialog, const void* poi) {
     if (capturing.load()) {
@@ -100,6 +170,11 @@ void tracedEvent(void* dialog, const void* event) {
         }
     }
     // Preserve the original call exactly once, including unrecognized events.
+    struct ConfirmationScope {
+        uint32_t previous;
+        explicit ConfirmationScope(uint32_t id):previous(scopedWaypoint) { scopedWaypoint=id; }
+        ~ConfirmationScope() { scopedWaypoint=previous; }
+    } scope(token && r.readOk && r.event && std::strcmp(r.event,"ACCEPT_ENTER")==0 ? r.waypoint : 0);
     originalEvent(dialog, event);
     if (token && r.event && std::strcmp(r.event,"ACCEPT_ENTER")==0) {
         // The original may destroy the dialog: never read it again after forwarding.
@@ -128,9 +203,9 @@ bool install(size_t rva, const unsigned char* signature, size_t size, void* repl
 void start() {
     std::lock_guard<std::mutex> lock(captureMutex);
     capturing.store(false); ++session; if(!session) ++session;
-    records.clear(); dropped=0; saved=false;
-    deadline=GetTickCount64()+180000; capturing.store(true);
-    status="Captura iniciada por até 3 minutos. Abra A e cancele; abra A e confirme; abra B e confirme.";
+    records.clear(); dropped=0; saved=false; verified={}; nextDirectAt=0;
+    deadline=GetTickCount64()+300000; capturing.store(true);
+    status="Captura iniciada por até 5 minutos. Viaje manualmente para A e B. Depois confira os botões de teste direto.";
 }
 void save() {
     std::vector<Record> snapshot;
@@ -145,19 +220,19 @@ void save() {
     try {
         std::filesystem::create_directories(directory);
         std::filesystem::path path;
-        do { path=directory/("waypoint_ui_v6_"+std::to_string(++savedNumber)+".tsv"); }
+        do { path=directory/("waypoint_request_v7_"+std::to_string(++savedNumber)+".tsv"); }
         while(std::filesystem::exists(path));
         std::ofstream out(path,std::ios::trunc);
         if(!out) { status="Falha ao abrir arquivo para salvar."; return; }
-        out<<"event\ttick_ms\tthread\twaypoint_id\tread_ok\tcontrol_id\tevent_subtype\tsetup_active\tevent_active\tdropped";
+        out<<"event\ttick_ms\tthread\twaypoint_id\tread_ok\tcontrol_id\tevent_subtype\tsetup_active\tevent_active\tdropped\tconfirmation_id\tcorrelated\tconnection_active\trender_thread\tsimple_active\trouted_active";
         for(int i=0;i<6;++i) out<<"\tgw2_rva_"<<i;
         out<<'\n';
         // Include hook health even when no candidate was hit.
-        out<<"STATUS\t"<<GetTickCount64()<<"\t0\t0\t0\t0\t0\t"<<setupHooked<<'\t'<<eventHooked<<'\t'<<lost;
+        out<<"STATUS\t"<<GetTickCount64()<<"\t0\t0\t0\t0\t0\t"<<setupHooked<<'\t'<<eventHooked<<'\t'<<lost<<"\t0\t0\t0\t"<<renderThread<<'\t'<<simpleHooked<<'\t'<<routedHooked;
         for(int i=0;i<6;++i) out<<'\t';
         out<<'\n';
         for(const auto& r:snapshot) {
-            out<<r.event<<'\t'<<r.tick<<'\t'<<r.thread<<'\t'<<r.waypoint<<'\t'<<r.readOk<<'\t'<<r.control<<'\t'<<r.subtype<<'\t'<<setupHooked<<'\t'<<eventHooked<<'\t'<<lost;
+            out<<r.event<<'\t'<<r.tick<<'\t'<<r.thread<<'\t'<<r.waypoint<<'\t'<<r.readOk<<'\t'<<r.control<<'\t'<<r.subtype<<'\t'<<setupHooked<<'\t'<<eventHooked<<'\t'<<lost<<'\t'<<r.confirmation<<'\t'<<r.correlated<<'\t'<<r.connected<<'\t'<<renderThread<<'\t'<<simpleHooked<<'\t'<<routedHooked;
             for(const auto address:r.stack) { char hex[24]{}; if(address) std::snprintf(hex,sizeof(hex),"0x%llX",static_cast<unsigned long long>(address)); out<<'\t'<<hex; }
             out<<'\n';
         }
@@ -168,12 +243,13 @@ void save() {
     } catch(...) { status="Falha ao salvar a captura."; }
 }
 void render() {
+    renderThread=GetCurrentThreadId();
     if(!visible) return;
-    ImGui::SetNextWindowSize(ImVec2(720,300),ImGuiCond_FirstUseEver);
-    if(ImGui::Begin("Waypoint Probe v0.6###MALLARD_WAYPOINT_PROBE",&visible)) {
-        ImGui::TextWrapped("Observa o destino e os botões do diálogo de confirmação. Os eventos são registrados automaticamente.");
+    ImGui::SetNextWindowSize(ImVec2(780,420),ImGuiCond_FirstUseEver);
+    if(ImGui::Begin("Waypoint Probe v0.7###MALLARD_WAYPOINT_PROBE",&visible)) {
+        ImGui::TextWrapped("Observa a solicitação nativa de viagem e permite um teste direto após validar a chamada manual.");
         ImGui::Text("Destino: %s | confirmação: %s",setupHooked?"ativo":"indisponível",eventHooked?"ativa":"indisponível");
-        if(supported&&setupHooked&&eventHooked) {
+        if(supported&&setupHooked&&eventHooked&&simpleHooked&&routedHooked) {
             if(ImGui::Button("Iniciar / recomeçar (descarta captura atual)")) start();
             ImGui::SameLine(); if(ImGui::Button("Parar e salvar")) save();
         }
@@ -186,12 +262,23 @@ void render() {
                 ImGui::Text("Último: %s | destino: %u | leitura: %s",r.event,r.waypoint,r.readOk?"OK":"falhou");
             }
         }
-        ImGui::TextWrapped("Teste: A → cancelar pelo botão; A → confirmar; B → confirmar. Não precisa marcar nem apertar atalho.");
+        ImGui::Text("Solicitação simples: %s | com rota: %s | thread do painel: %u",simpleHooked?"ativa":"indisponível",routedHooked?"ativa":"indisponível",renderThread);
+        for(size_t i=0;i<testWaypoints.size();++i) {
+            const uint32_t id=testWaypoints[i];
+            const bool ready=canDirect(id);
+            DWORD manualThread=0;
+            { std::lock_guard<std::mutex> lock(captureMutex); manualThread=verified[i].thread; }
+            ImGui::BeginDisabled(!ready);
+            if(ImGui::Button(i==0?"Viajar direto para A (teste)":"Viajar direto para B (teste)")) directTravel(id);
+            ImGui::EndDisabled();
+            ImGui::SameLine(); ImGui::Text("Thread manual validada: %u",manualThread);
+        }
+        ImGui::TextWrapped("Primeiro viaje manualmente para A e B. Se os botões liberarem, teste A e depois B, aguardando cada chegada. Se ficarem desativados, salve o registro.");
         ImGui::Separator(); ImGui::TextWrapped("%s",status.c_str());
     }
     ImGui::End();
 }
-void options() { if(ImGui::Button("Abrir Waypoint Probe v0.6")) visible=true; }
+void options() { if(ImGui::Button("Abrir Waypoint Probe v0.7")) visible=true; }
 void load(AddonAPI_t* nexus) {
     api=nexus;
     ImGui::SetCurrentContext(static_cast<ImGuiContext*>(api->ImguiContext));
@@ -202,8 +289,10 @@ void load(AddonAPI_t* nexus) {
     if(supported&&api->MinHook_Create&&api->MinHook_Enable&&api->MinHook_Disable&&api->MinHook_Remove) {
         setupHooked=install(setupRva,setupBytes,sizeof(setupBytes),reinterpret_cast<void*>(&tracedSetup),reinterpret_cast<void**>(&originalSetup));
         eventHooked=install(eventRva,eventBytes,sizeof(eventBytes),reinterpret_cast<void*>(&tracedEvent),reinterpret_cast<void**>(&originalEvent));
+        simpleHooked=install(simpleRva,simpleBytes,sizeof(simpleBytes),reinterpret_cast<void*>(&tracedSimple),reinterpret_cast<void**>(&originalSimple));
+        routedHooked=install(routedRva,routedBytes,sizeof(routedBytes),reinterpret_cast<void*>(&tracedRouted),reinterpret_cast<void**>(&originalRouted));
     }
-    status=setupHooked&&eventHooked?"Pronto para o teste de confirmação.":"Captura indisponível: versão/assinatura do executável ou instalação dos hooks não corresponde.";
+    status=setupHooked&&eventHooked&&simpleHooked&&routedHooked?"Pronto para o teste de confirmação.":"Captura indisponível: versão/assinatura do executável ou instalação dos hooks não corresponde.";
     api->GUI_Register(RT_Render,render); api->GUI_Register(RT_OptionsRender,options);
 }
 void unload() {
@@ -211,6 +300,8 @@ void unload() {
     api->GUI_Deregister(render); api->GUI_Deregister(options);
     // AF_DisableHotloading: only remove while the game is shutting down.
     if(setupHooked) { auto* p=reinterpret_cast<unsigned char*>(host)+setupRva; api->MinHook_Disable(p); api->MinHook_Remove(p); }
+    if(simpleHooked) { auto* p=reinterpret_cast<unsigned char*>(host)+simpleRva; api->MinHook_Disable(p); api->MinHook_Remove(p); }
+    if(routedHooked) { auto* p=reinterpret_cast<unsigned char*>(host)+routedRva; api->MinHook_Disable(p); api->MinHook_Remove(p); }
     if(eventHooked) { auto* p=reinterpret_cast<unsigned char*>(host)+eventRva; api->MinHook_Disable(p); api->MinHook_Remove(p); }
 }
 }
@@ -218,6 +309,6 @@ extern "C" __declspec(dllexport) AddonDefinition_t* GetAddonDef() {
     static AddonDefinition_t d{};
     d.Signature=static_cast<uint32_t>(-1847302962); d.APIVersion=NEXUS_API_VERSION;
     d.Name="Waypoint Probe"; d.Author="Mallard"; d.Description="Observa seleção e confirmação de waypoint na interface.";
-    d.Version={0,6,0,0}; d.Load=load; d.Unload=unload; d.Flags=AF_DisableHotloading; d.Provider=UP_None;
+    d.Version={0,7,0,0}; d.Load=load; d.Unload=unload; d.Flags=AF_DisableHotloading; d.Provider=UP_None;
     return &d;
 }

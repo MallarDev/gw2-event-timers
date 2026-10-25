@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(WaypointProbe VERSION 0.6.0 LANGUAGES CXX)
+project(WaypointProbe VERSION 0.7.0 LANGUAGES CXX)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
