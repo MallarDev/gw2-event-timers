@@ -333,15 +333,27 @@ pub fn render_settings(ui: &Ui) {
         // --- Other ---
         ui.text("Other");
         ui.checkbox("Close window with ESC", &mut config.close_on_escape);
-        ui.text("Left-click on event waypoint:");
-        if ui.radio_button_bool("Copy waypoint", config.waypoint_click_action == crate::config::WaypointClickAction::Copy) {
-            config.waypoint_click_action = crate::config::WaypointClickAction::Copy;
+        ui.text("Left-click on an event:");
+        for (label, action) in [
+            ("Teleport directly", crate::config::WaypointClickAction::Teleport),
+            ("Open map at waypoint (requires Pie UI)", crate::config::WaypointClickAction::OpenMap),
+            ("Copy waypoint", crate::config::WaypointClickAction::Copy),
+        ] {
+            if ui.radio_button_bool(label, config.waypoint_click_action == action) {
+                config.waypoint_click_action = action;
+            }
         }
-        if ui.radio_button_bool("Open map (requires Pie UI)", config.waypoint_click_action == crate::config::WaypointClickAction::OpenMap) {
-            config.waypoint_click_action = crate::config::WaypointClickAction::OpenMap;
-        }
-        if config.waypoint_click_action == crate::config::WaypointClickAction::OpenMap && !crate::pie_ui::available() {
-            ui.text_disabled("Pie UI not loaded: click copies the waypoint instead.");
+        match config.waypoint_click_action {
+            crate::config::WaypointClickAction::Teleport => {
+                ui.text_disabled("Travel starts immediately and uses normal waypoint costs.");
+                if let Some(reason) = crate::waypoint_travel::unavailable_reason() {
+                    ui.text_wrapped(reason);
+                }
+            }
+            crate::config::WaypointClickAction::OpenMap if !crate::pie_ui::available() => {
+                ui.text_disabled("Install/load Pie UI to use this action.");
+            }
+            _ => {}
         }
         ui.checkbox(
             "Include event name when copying waypoint",

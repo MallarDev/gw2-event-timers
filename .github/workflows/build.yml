@@ -2,7 +2,7 @@ name: Build Event Timers DLL
 
 on:
   push:
-    branches: [main]
+    branches: [main, feat/direct-waypoint-travel]
   pull_request:
   workflow_dispatch:
 

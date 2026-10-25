@@ -2,7 +2,7 @@ use nexus::imgui::{
     Condition, MenuItem, MouseButton, StyleColor, StyleVar, Ui, Window, WindowFlags,
 };
 
-use crate::config::{NotificationConfig, ToastPosition, RUNTIME_CONFIG};
+use crate::config::{NotificationConfig, ToastPosition, WaypointClickAction, RUNTIME_CONFIG};
 use crate::notifications::{ToastNotification, NOTIFICATION_STATE};
 use crate::time_utils::format_time_only;
 
@@ -40,9 +40,9 @@ fn calculate_toast_position(
     }
 }
 
-/// Result from rendering a toast: (clicked_to_copy, dismissed)
+/// Result from rendering a toast: (waypoint_clicked, dismissed)
 struct ToastAction {
-    copy_clicked: bool,
+    waypoint_clicked: bool,
     dismissed: bool,
 }
 
@@ -53,9 +53,10 @@ fn render_single_toast(
     position: [f32; 2],
     size: [f32; 2],
     config: &NotificationConfig,
+    click_action: WaypointClickAction,
 ) -> ToastAction {
     let mut action = ToastAction {
-        copy_clicked: false,
+        waypoint_clicked: false,
         dismissed: false,
     };
     let _alpha = ui.push_style_var(StyleVar::Alpha(toast.opacity));
@@ -142,7 +143,7 @@ fn render_single_toast(
             // Click hint if copy_text available
             if !toast.copy_text.is_empty() {
                 ui.set_window_font_scale(scale * 0.7);
-                ui.text_colored([0.5, 0.5, 0.5, 1.0], "Click to copy waypoint");
+                ui.text_colored([0.5, 0.5, 0.5, 1.0], crate::waypoint_actions::hint(click_action));
             }
 
             ui.set_window_font_scale(1.0);
@@ -153,7 +154,7 @@ fn render_single_toast(
             }
             // Check for click anywhere else to copy waypoint
             else if ui.is_window_hovered() && ui.is_mouse_clicked(MouseButton::Left) {
-                action.copy_clicked = true;
+                action.waypoint_clicked = true;
             }
         });
 
@@ -162,11 +163,12 @@ fn render_single_toast(
 
 /// Render toast notifications (call from main render loop)
 pub fn render_toast_notifications(ui: &Ui) {
-    let (notification_config, copy_with_event_name) = {
+    let (notification_config, copy_with_event_name, click_action) = {
         let config = RUNTIME_CONFIG.lock();
         (
             config.notification_config.clone(),
             config.copy_with_event_name,
+            config.waypoint_click_action,
         )
     };
 
@@ -205,8 +207,8 @@ pub fn render_toast_notifications(ui: &Ui) {
                 offset_x,
                 offset_y,
             );
-            let action = render_single_toast(ui, preview, pos, toast_size, &notification_config);
-            if action.copy_clicked && !preview.copy_text.is_empty() {
+            let action = render_single_toast(ui, preview, pos, toast_size, &notification_config, WaypointClickAction::Copy);
+            if action.waypoint_clicked && !preview.copy_text.is_empty() {
                 let copy_text = if copy_with_event_name {
                     format!("{}: {}", preview.event_id.event_name, preview.copy_text)
                 } else {
@@ -225,7 +227,7 @@ pub fn render_toast_notifications(ui: &Ui) {
     }
 
     // Collect actions from clicked toasts
-    let mut copy_text_to_set: Option<String> = None;
+    let mut waypoint_to_activate: Option<(String, String)> = None;
     let mut toasts_to_dismiss: Vec<u64> = Vec::new();
 
     {
@@ -244,14 +246,9 @@ pub fn render_toast_notifications(ui: &Ui) {
                 offset_x,
                 offset_y,
             );
-            let action = render_single_toast(ui, toast, pos, toast_size, &notification_config);
-            if action.copy_clicked && !toast.copy_text.is_empty() {
-                let copy_text = if copy_with_event_name {
-                    format!("{}: {}", toast.event_id.event_name, toast.copy_text)
-                } else {
-                    toast.copy_text.clone()
-                };
-                copy_text_to_set = Some(copy_text);
+            let action = render_single_toast(ui, toast, pos, toast_size, &notification_config, click_action);
+            if action.waypoint_clicked && !toast.copy_text.is_empty() {
+                waypoint_to_activate = Some((toast.event_id.event_name.clone(), toast.copy_text.clone()));
             }
             if action.dismissed {
                 toasts_to_dismiss.push(toast.id);
@@ -259,9 +256,9 @@ pub fn render_toast_notifications(ui: &Ui) {
         }
     }
 
-    // Copy to clipboard outside of lock
-    if let Some(text) = copy_text_to_set {
-        ui.set_clipboard_text(&text);
+    // Activate outside of the notification-state lock.
+    if let Some((name, link)) = waypoint_to_activate {
+        crate::waypoint_actions::perform(ui, click_action, &name, &link, copy_with_event_name);
     }
 
     // Dismiss toasts outside of render lock
@@ -283,12 +280,13 @@ thread_local! {
 
 /// Render the upcoming events panel
 pub fn render_upcoming_panel(ui: &Ui) {
-    let (panel_enabled, panel_size, copy_with_event_name) = {
+    let (panel_enabled, panel_size, copy_with_event_name, click_action) = {
         let config = RUNTIME_CONFIG.lock();
         (
             config.notification_config.upcoming_panel_enabled,
             config.notification_config.upcoming_panel_size,
             config.copy_with_event_name,
+            config.waypoint_click_action,
         )
     };
 
@@ -297,7 +295,7 @@ pub fn render_upcoming_panel(ui: &Ui) {
     }
 
     // Collect actions to perform outside of lock
-    let mut copy_text_to_set: Option<String> = None;
+    let mut waypoint_to_activate: Option<(String, String)> = None;
     let mut event_to_untrack: Option<crate::config::TrackedEventId> = None;
     let mut wiki_to_open: Option<String> = None;
     let upcoming_events = NOTIFICATION_STATE.lock().upcoming_events.clone();
@@ -376,7 +374,7 @@ pub fn render_upcoming_panel(ui: &Ui) {
                         if !event.copy_text.is_empty() {
                             ui.text(format!("Waypoint: {}", event.copy_text));
                             ui.separator();
-                            ui.text_disabled("Left-click to copy");
+                            ui.text_disabled(crate::waypoint_actions::hint(click_action));
                         }
                         ui.text_disabled("Right-click for options");
                     });
@@ -385,14 +383,7 @@ pub fn render_upcoming_panel(ui: &Ui) {
                 // Left-click: copy waypoint (respects copy_with_event_name setting)
                 if row_hovered && ui.is_mouse_clicked(MouseButton::Left) {
                     if !event.copy_text.is_empty() {
-                        if copy_with_event_name {
-                            copy_text_to_set = Some(format!(
-                                "{}: {}",
-                                event.event_id.event_name, event.copy_text
-                            ));
-                        } else {
-                            copy_text_to_set = Some(event.copy_text.clone());
-                        }
+                        waypoint_to_activate = Some((event.event_id.event_name.clone(), event.copy_text.clone()));
                     }
                 }
 
@@ -442,9 +433,9 @@ pub fn render_upcoming_panel(ui: &Ui) {
         config.notification_config.upcoming_panel_enabled = false;
     }
 
-    // Copy to clipboard outside of lock
-    if let Some(text) = copy_text_to_set {
-        ui.set_clipboard_text(&text);
+    // Activate outside of the notification-state lock.
+    if let Some((name, link)) = waypoint_to_activate {
+        crate::waypoint_actions::perform(ui, click_action, &name, &link, copy_with_event_name);
     }
 
     // Untrack event outside of lock

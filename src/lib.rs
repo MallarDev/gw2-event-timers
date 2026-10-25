@@ -20,6 +20,9 @@ mod json_loader;
 mod notification_logic;
 mod notifications;
 mod pie_ui;
+mod waypoint_actions;
+mod waypoint_link;
+mod waypoint_travel;
 mod time_utils;
 mod ui;
 
@@ -78,6 +81,7 @@ nexus::export! {
 fn load() {
     load_user_config();
     pie_ui::load();
+    waypoint_travel::load();
     completion::load();
     BG_STOP.store(false, Ordering::Relaxed);
 
@@ -98,6 +102,7 @@ fn load() {
     register_render(
         RenderType::Render,
         render!(|ui| {
+            waypoint_travel::poll_feedback();
             sync_quick_access();
             render_main_window(ui);
             let (toast_enabled, upcoming_enabled) = {
@@ -190,6 +195,7 @@ fn sync_quick_access() {
 }
 
 fn unload() {
+    waypoint_travel::unload();
     pie_ui::unload();
     BG_STOP.store(true, Ordering::Relaxed);
     if let Some(h) = BG_THREAD.lock().take() {

@@ -13,6 +13,7 @@ use crate::json_loader::{load_tracks_from_json, EventTrack};
 
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum WaypointClickAction {
+    Teleport,
     Copy,
     #[default]
     OpenMap,
@@ -984,5 +985,20 @@ pub fn get_track_visual_config(
     TrackVisualConfig {
         background_color: global_bg,
         padding: global_padding,
+    }
+}
+
+#[cfg(test)]
+mod waypoint_action_tests {
+    use super::WaypointClickAction;
+    #[test]
+    fn preserves_existing_choices_and_round_trips_all_three_actions() {
+        for action in [WaypointClickAction::Teleport, WaypointClickAction::OpenMap, WaypointClickAction::Copy] {
+            let json = serde_json::to_string(&action).unwrap();
+            assert_eq!(serde_json::from_str::<WaypointClickAction>(&json).unwrap(), action);
+        }
+        assert_eq!(serde_json::from_str::<WaypointClickAction>("\"OpenMap\"").unwrap(), WaypointClickAction::OpenMap);
+        assert_eq!(serde_json::from_str::<WaypointClickAction>("\"Copy\"").unwrap(), WaypointClickAction::Copy);
+        assert_eq!(WaypointClickAction::default(), WaypointClickAction::OpenMap);
     }
 }

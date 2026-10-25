@@ -1284,21 +1284,13 @@ fn handle_track_tooltip(
                     ui.text(&timing_text);
                     if !event.copy_text.is_empty() {
                         ui.separator();
-                        ui.text(if waypoint_click_action == WaypointClickAction::OpenMap && crate::pie_ui::available() { "Click to open waypoint on map (Pie UI)" } else { "Click to copy waypoint" });
+                        ui.text(crate::waypoint_actions::hint(waypoint_click_action));
                     }
                 });
 
                 if ui.is_mouse_clicked(MouseButton::Left) && !event.copy_text.is_empty() {
-                    if waypoint_click_action != WaypointClickAction::OpenMap || !crate::pie_ui::open_waypoint(&event.copy_text) {
-                        let copy_text = CACHED_COPY_WITH_EVENT_NAME.with(|c| {
-                            if c.get() {
-                                format!("{}: {}", event.name, event.copy_text)
-                            } else {
-                                event.copy_text.clone()
-                            }
-                        });
-                        ui.set_clipboard_text(&copy_text);
-                    }
+                    let include_name = CACHED_COPY_WITH_EVENT_NAME.with(|c| c.get());
+                    crate::waypoint_actions::perform(ui, waypoint_click_action, &event.name, &event.copy_text, include_name);
                 }
 
                 // Right-click to track/untrack event
